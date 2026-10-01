@@ -284,7 +284,8 @@ video records. Credentials and individual video results are not logged.
 The assigned proxy rotates between videos. Selection uses the YouTube column
 group: a previous `youtube_last_response_at` makes a configuration eligible,
 and ordering puts configurations with `youtube_last_http_status` first, followed
-by `youtube_last_check_duration_ms`. An HTTP response does not imply usable data.
+by the most recent `youtube_last_response_at` and then proxy ID. An HTTP response
+does not imply usable data.
 Each video gets one attempt through its assigned configuration. A failed attempt
 records the error and processing moves on.
 Clients are created when used and reused for later requests. The shared CA store,
@@ -311,7 +312,7 @@ Proxy-based metadata collection, including catalog mode, reports each attempt to
 background statistics writer. Use the current
 [`db/proxy/schema.sql`](db/proxy/schema.sql) for a fresh database, or apply the
 missing [proxy migrations](db/README.md#proxy-schema-migrations) through
-[`009_shared_proxy_protocol.sql`](db/proxy/migrations/009_shared_proxy_protocol.sql)
+[`010_drop_youtube_check_fields.sql`](db/proxy/migrations/010_drop_youtube_check_fields.sql)
 before starting collectors or importing tester results.
 Statistics failures never pause or throttle collection, and shutdown never waits
 for a statistics flush. Unwritten statistics may be lost. The existing behavior

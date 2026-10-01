@@ -36,7 +36,7 @@ DATA = {'videoDetails': {'videoId': VIDEO, 'title': 'Available metadata'},
 
 
 def outcome(at=T, success=True, sent=True, status=200):
-    return AttemptOutcome(at, sent, status, success, 20.0)
+    return AttemptOutcome(at, sent, status, success)
 
 
 def batch(*observations, target=TARGET):
@@ -48,8 +48,8 @@ def batch(*observations, target=TARGET):
 
 class WeightTests(unittest.TestCase):
     def test_connection_success_survives_a_later_failure_and_error_clears_on_success(self):
-        connected = AttemptOutcome(T,False,None,False,20,True,'proxy_handshake:proxy_http_407')
-        failed = AttemptOutcome(T+timedelta(seconds=1),False,None,False,20,False,'connect:connection_refused')
+        connected = AttemptOutcome(T,False,None,False,True,'proxy_handshake:proxy_http_407')
+        failed = AttemptOutcome(T+timedelta(seconds=1),False,None,False,False,'connect:connection_refused')
         aggregate = batch(failed,connected).aggregates[TARGET]
         self.assertEqual(aggregate.successful_connections,1)
         self.assertEqual(aggregate.last_connected_at,T)
@@ -65,9 +65,9 @@ class WeightTests(unittest.TestCase):
         self.assertIsNone(aggregate.last_connection_error)
         self.assertIsNone(aggregate.last_connected_at)
         with self.assertRaises(ValueError):
-            batch(AttemptOutcome(T,True,200,True,20,False))
+            batch(AttemptOutcome(T,True,200,True,False))
         with self.assertRaises(ValueError):
-            batch(AttemptOutcome(T,False,None,False,20,False,'secret raw exception'))
+            batch(AttemptOutcome(T,False,None,False,False,'secret raw exception'))
 
     def test_recent_deterioration_uses_fifteen_attempt_weight_and_six_success_weight(self):
         aggregate = Aggregate()
@@ -523,8 +523,8 @@ class StatisticsDatabaseTests(unittest.TestCase):
     def test_connection_counts_and_latest_error_persist_without_replaying(self):
         self.fresh()
         self.proxy()
-        value=batch(AttemptOutcome(T,False,None,False,20,True,'proxy_handshake:proxy_http_407'),
-                    AttemptOutcome(T+timedelta(seconds=1),False,None,False,20,False,'connect:timeout'))
+        value=batch(AttemptOutcome(T,False,None,False,True,'proxy_handshake:proxy_http_407'),
+                    AttemptOutcome(T+timedelta(seconds=1),False,None,False,False,'connect:timeout'))
         write_batch(self.conn,value)
         write_batch(self.conn,value)
         self.assertEqual(self.conn.execute('SELECT successful_connections,last_connected_at,last_connection_error FROM proxy_stats').fetchone(),(1,T,'connect:timeout'))

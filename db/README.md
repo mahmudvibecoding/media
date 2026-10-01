@@ -53,7 +53,7 @@ The backup and verification report are retained under
 
 ## Compact proxy database
 
-The proxy database has three tables and 34 stored columns. Each proxy has at most
+The proxy database has three tables and 32 stored columns. Each proxy has at most
 one `proxy_stats` row, created when a check or collection outcome is recorded.
 Connection fields are shared; each supported website has a fixed group of columns
 in that same row. The installed website group is YouTube.
@@ -61,7 +61,7 @@ in that same row. The installed website group is YouTube.
 | Table | Columns | Contents |
 | --- | ---: | --- |
 | `proxies` | 6 | Connection identity, address, port, transport configuration and last discovery |
-| `proxy_stats` | 20 | Shared connection observations and separate YouTube results, counters, score inputs and import marker |
+| `proxy_stats` | 18 | Shared connection observations and separate YouTube results, counters, score inputs and import marker |
 | `proxy_lists` | 8 | Source URLs, protocol hints, enable setting and current collection state |
 
 `proxy_catalog`, `proxy_health`, and `proxy_list_catalog` are views for Postico.
@@ -126,17 +126,15 @@ proxy failures that prevented its request, so it describes that check's outcome.
 
 ### YouTube columns
 
-The other 13 columns keep YouTube results and import order independent of future
+The other 11 columns keep YouTube results and import order independent of future
 website groups:
 
 | Field | Meaning |
 | --- | --- |
-| `youtube_last_checked_at` | Latest check, including configuration or protocol rejection before a network attempt. |
-| `youtube_last_attempt_at` | Completion time of the latest actual YouTube attempt; unchanged by checks rejected before an attempt. |
+| `youtube_last_attempt_at` | Observation time of the latest actual YouTube attempt; protects against stale attempt imports and is unchanged by checks rejected before an attempt. |
 | `youtube_last_http_status` | HTTP status from the latest actual attempt, or NULL if it received no response. |
-| `youtube_last_check_duration_ms` | Duration of the latest check, including checks rejected before an attempt. |
 | `youtube_last_response_at` | Time of the latest verified YouTube HTTP response; retained after later failures. |
-| `youtube_last_error` | Latest check's safe `stage:code` label for setup, network, HTTP or data failure; NULL when successful or unobserved. |
+| `youtube_last_error` | Most recently imported outcome's safe `stage:code` label for setup, network, HTTP or data failure; NULL when successful or unobserved. |
 | `youtube_requests_sent` | Requests actually sent to YouTube, excluding proxy negotiation. |
 | `youtube_responses_received` | Verified YouTube HTTP responses, including error statuses and challenges. |
 | `youtube_successful_data_received` | Responses the metadata collector reported as usable data, before saving the video. |
@@ -153,9 +151,10 @@ The `proxy_health.youtube_responded` boolean describes the latest actual attempt
 | `FALSE` | An actual attempt finished without a YouTube response. |
 | `NULL` | No actual YouTube attempt has been recorded. |
 
-A later configuration rejection can update `youtube_last_checked_at` and
-`youtube_last_error` while preserving the previous actual-attempt fields. Read
-those timestamps together. Response status alone does not measure usable data.
+A configuration rejection can update `youtube_last_error` and the import key
+while preserving the previous actual-attempt fields and counters. Its check time
+is not stored, so import rejection-only journals in chronological order to keep
+their error current. Response status alone does not measure usable data.
 
 The collector records the upstream connection behind its local bridge. Merely
 reaching that local helper is not a successful proxy connection. Helper failures
@@ -172,7 +171,7 @@ their group is installed and allowed in code. The current metadata collector and
 legacy journal importer both use YouTube.
 
 An accepted batch updates shared connection observations plus only the chosen
-website's columns. Replay checks use that website's check time and import key.
+website's columns. Replay checks use that website's latest attempt time and import key.
 Scores use that website's attempts and data successes. Shared timestamps keep the
 latest observation across websites. Keep one ordered producer per proxy and website;
 independent producers for the same website can produce stale batches.
@@ -214,6 +213,10 @@ Apply each missing migration once:
 /opt/homebrew/opt/postgresql@18/bin/psql -X \
   -h "$PWD/.local/postgres/socket" -U mahmud -d proxy -v ON_ERROR_STOP=1 \
   -f db/proxy/migrations/009_shared_proxy_protocol.sql
+# Remove the YouTube check timestamp and duration:
+/opt/homebrew/opt/postgresql@18/bin/psql -X \
+  -h "$PWD/.local/postgres/socket" -U mahmud -d proxy -v ON_ERROR_STOP=1 \
+  -f db/proxy/migrations/010_drop_youtube_check_fields.sql
 ```
 
 Migration 005 locks the three tables and compares every retained value before
@@ -244,6 +247,13 @@ cleared from `last_connection_error`, with the website error retained or filled
 when it describes the same latest check. The catalog and health views expose
 only the shared confirmed protocol.
 
+Migration 010 removes `youtube_last_checked_at` and
+`youtube_last_check_duration_ms` from the table and health view. Import ordering
+uses the existing `youtube_last_attempt_at` plus `youtube_last_import_key`;
+rejected configurations do not advance the attempt time or add counters. Proxy
+selection orders by response status, response recency and proxy ID. All retained
+values and the identity sequence stay unchanged.
+
 Back up the database and stop collectors/importers before upgrading so every
 writer starts with matching code and schema. The SQL files manage their own
 transactions. Run each file once, after checking which migrations the installed
@@ -263,11 +273,17 @@ Migration 009's backup and receipt are under
 The proxy regression suite covers the new layout, preservation of binary options,
 identity matching and separation of proxy errors from website errors.
 
+Migration 010 committed locally on October 1, 2026. Its backup and receipt are
+under `.local/proxy-drop-check-fields-20261001/`: `proxy-before-010.dump` and
+`migration.json`. An ordered binary comparison verified every retained
+statistics value across all 6,014,525 rows. Counts, the identity sequence and
+viewer access also matched before and after the migration.
+
 ### Historical connection backfill
 
 An older catalog whose connection observations have not been initialized can use
 retained finished journals. The current helper targets the schema through
-migration 009. The October 1 local backfill was already applied before migration
+migration 010. The October 1 local backfill was already applied before migration
 008; it does not need to be repeated.
 
 For that retained journal set, the original command was:
@@ -339,7 +355,7 @@ pending statistics may be lost. Missing observations are unknown, not failures.
 
 An immutable batch identifier is committed with its counters in
 `youtube_last_import_key`. Exact retries are skipped. A batch overlapping a newer
-YouTube result is skipped for the affected proxy, so an old retry cannot
+YouTube attempt is skipped for the affected proxy, so an old retry cannot
 double-count after detailed history has been discarded. Use one ordered writer
 per configuration and website. Concurrent independent producers or legacy imports
 can cause stale statistics to be skipped while collection continues.
@@ -408,7 +424,9 @@ attempted a connection and received a response; inconsistent or unsupported
 status results are rejected. Journal status is validated during import; it is
 not stored in `proxy_stats`. An exact retry of the latest YouTube journal for a
 proxy is skipped using `youtube_last_import_key`. Older or changed overlapping
-YouTube journals are rejected before any counts change.
+YouTube attempt results are rejected before any counts change, using
+`youtube_last_attempt_at`. Rejections before an attempt do not advance that time
+or add counters; their errors follow import order.
 Import rounds in chronological order; do not append to an already imported
 journal or replay old rounds after importing newer ones for the same proxies.
 

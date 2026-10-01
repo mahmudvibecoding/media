@@ -34,7 +34,7 @@ def discover_journals(paths):
 def prepare_history(conn):
     conn.execute('''CREATE TEMP TABLE connection_backfill (
         proxy_id BIGINT PRIMARY KEY, connection_key BYTEA NOT NULL, declared_protocol TEXT NOT NULL,
-        checked_at TIMESTAMPTZ NOT NULL, last_connection_error TEXT,
+        checked_at TIMESTAMPTZ, last_connection_error TEXT,
         connection_attempts BIGINT NOT NULL, requests_sent BIGINT NOT NULL,
         successful_connections BIGINT NOT NULL, last_connected_at TIMESTAMPTZ
     )''')
@@ -46,12 +46,14 @@ def merge_history(conn):
     if mismatch:
         raise ValueError('A proxy identity changed between saved journals')
     conn.execute('''INSERT INTO connection_backfill AS h
-        SELECT proxy_id,connection_key,declared_protocol,checked_at,connection_error,
+        SELECT proxy_id,connection_key,declared_protocol,
+               CASE WHEN attempted THEN checked_at END,connection_error,
                attempted::integer,requests_sent,connected::integer,
                CASE WHEN connected THEN checked_at END
         FROM import_proxy_results
         ON CONFLICT (proxy_id) DO UPDATE SET
-            last_connection_error=CASE WHEN excluded.checked_at >= h.checked_at
+            last_connection_error=CASE WHEN excluded.checked_at IS NOT NULL
+                AND (h.checked_at IS NULL OR excluded.checked_at >= h.checked_at)
                 THEN excluded.last_connection_error ELSE h.last_connection_error END,
             checked_at=greatest(h.checked_at,excluded.checked_at),
             connection_attempts=h.connection_attempts+excluded.connection_attempts,
@@ -81,7 +83,8 @@ def validate_history(conn):
     row = conn.execute('''SELECT
         count(*) FILTER(WHERE p.proxy_id IS NULL OR p.connection_key<>b.connection_key
             OR p.connection_settings->>'transport' IS DISTINCT FROM b.declared_protocol),
-        count(*) FILTER(WHERE s.proxy_id IS NULL OR s.youtube_last_checked_at<b.checked_at
+        count(*) FILTER(WHERE s.proxy_id IS NULL
+            OR (b.checked_at IS NOT NULL AND (s.youtube_last_attempt_at IS NULL OR s.youtube_last_attempt_at<b.checked_at))
             OR s.connection_attempts<b.connection_attempts OR s.youtube_requests_sent<b.requests_sent),
         count(*) FILTER(WHERE b.successful_connections<0 OR b.successful_connections>b.connection_attempts
             OR (b.last_connected_at IS NOT NULL AND b.last_connected_at>b.checked_at))

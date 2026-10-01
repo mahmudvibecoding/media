@@ -77,11 +77,11 @@ configuration IDs, identity hashes, timing, and response classifications;
 response bodies and credentials are not saved in results.
 
 The current schema is [db/proxy/schema.sql](../db/proxy/schema.sql): three tables
-with 34 stored columns, including 20 in `proxy_stats`. There is one statistics
+with 32 stored columns, including 18 in `proxy_stats`. There is one statistics
 row per configuration, with shared connection fields and a fixed `youtube_*`
 column group. Individual test history stays in the retained journals.
 Existing databases must apply missing [proxy migrations](../db/README.md#proxy-schema-migrations)
-through [migration 009](../db/proxy/migrations/009_shared_proxy_protocol.sql)
+through [migration 010](../db/proxy/migrations/010_drop_youtube_check_fields.sql)
 before using the current importer. Fresh databases use the current schema file.
 Import an immutable finished journal with its metadata and final summary beside it:
 
@@ -105,17 +105,19 @@ not divide the final database commit.
 
 **Import YouTube rounds in chronological order.** An exact retry of the latest
 imported journal is skipped using `youtube_last_import_key`. Older or changed
-overlapping YouTube journals fail without changing counters. Do not append to an
-already imported journal. These restrictions keep
+overlapping YouTube attempt results fail without changing counters. Do not append
+to an already imported journal. These restrictions keep
 retry state bounded to one digest per proxy and website after detailed database
-history is deleted. Import ordering uses `youtube_last_checked_at` independently
-of shared connection timestamps.
+history is deleted. Import ordering uses `youtube_last_attempt_at` independently
+of shared connection timestamps. Checks rejected before an attempt do not advance
+that time or add counters. Their check times are not stored, so their errors
+follow import order.
 
 Shared statistics retain `connection_attempts`, `successful_connections`,
 `last_connection_attempt_at`, `last_connected_at`, `last_connection_error`, and
 `working_protocol`. The confirmed protocol is shared across websites.
-YouTube has its own check and attempt timestamps, HTTP status,
-duration, last response, error, counters and scoring inputs. See the
+YouTube has its own attempt timestamp, HTTP status,
+last response, error, counters and scoring inputs. See the
 [field reference](../db/README.md#youtube-columns) for their exact names.
 
 Journal status must consistently determine the attempted/response flags;
@@ -184,8 +186,8 @@ FROM proxy_stats;
 ```
 
 `youtube_last_response_at` retains a previous success even when
-`youtube_responded` becomes false. `youtube_last_checked_at` can be newer than
-`youtube_last_attempt_at` after a configuration rejection. These fields describe
+`youtube_responded` becomes false. A configuration rejection updates its error
+without advancing `youtube_last_attempt_at`. These fields describe
 observed results; availability can change. Identity is per saved configuration,
 so multiple configurations can refer to the same endpoint.
 

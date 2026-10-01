@@ -50,7 +50,7 @@ class ErrorSeparationTests(unittest.TestCase):
                       'proxy_handshake:timeout'):
             with self.subTest(label=label):
                 aggregate = Aggregate()
-                aggregate.add(AttemptOutcome(T, False, None, False, 20, True, label), 'http')
+                aggregate.add(AttemptOutcome(T, False, None, False, True, label), 'http')
                 self.assertIsNone(aggregate.last_connection_error)
                 self.assertEqual(aggregate.last_website_error, label)
                 self.assertEqual(aggregate.successful_connections, 1)
@@ -145,12 +145,12 @@ class SharedProtocolDatabaseTests(unittest.TestCase):
             (proxy.key, proxy.address, proxy.port, Jsonb(pack_connection_settings(proxy.protocol, proxy.settings)), T)).fetchone()[0]
         target = ProxyTarget.from_catalog(identifier, proxy.key, 'http')
         observations = [
-            AttemptOutcome(T, True, 200, True, 20, True),
-            AttemptOutcome(T + timedelta(seconds=1), False, None, False, 20, True,
+            AttemptOutcome(T, True, 200, True, True),
+            AttemptOutcome(T + timedelta(seconds=1), False, None, False, True,
                            website_error='youtube_https:timeout'),
-            AttemptOutcome(T + timedelta(seconds=2), False, None, False, 20, True,
+            AttemptOutcome(T + timedelta(seconds=2), False, None, False, True,
                            'proxy_handshake:proxy_http_407'),
-            AttemptOutcome(T + timedelta(seconds=3), True, 403, False, 20, True,
+            AttemptOutcome(T + timedelta(seconds=3), True, 403, False, True,
                            website_error='http:http_403'),
         ]
         for index, observation in enumerate(observations):

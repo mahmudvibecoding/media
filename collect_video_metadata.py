@@ -270,7 +270,6 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
     started = time.monotonic()
     for _ in range(retries + 1):
         result = {"status": "error", "metadata": None}
-        attempt_started = time.monotonic()
         bridge = getattr(client, 'catalog_bridge', None)
         trace = RequestTrace(bridge=bridge is not None) if on_attempt is not None else None
         connection_error = None
@@ -323,7 +322,6 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
                         checked_at=datetime.now(timezone.utc),
                         request_sent=trace.request_sent or result.get('http_status') is not None,
                         http_status=result.get('http_status'), data_received=has_metadata(result),
-                        duration_ms=(time.monotonic()-attempt_started)*1000,
                         connected=True if trace.request_sent or result.get('http_status') is not None else trace.connected,
                         connection_error=proxy_connection_error(connection_error),
                         website_error=youtube_error_label(result, connection_error)))

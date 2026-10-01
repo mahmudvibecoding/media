@@ -1,7 +1,9 @@
 """Import immutable, finished journals into bounded per-proxy statistics.
 
 Import rounds in chronological order. An exact retry of a proxy's latest journal
-is skipped. Older or changed overlapping journals fail without changing totals.
+is skipped. Older or changed overlapping attempt results fail without changing
+totals. Checks rejected before an attempt have no stored timestamp; their errors
+follow import order.
 """
 
 import argparse
@@ -103,22 +105,22 @@ def apply_staged(conn, journal_key):
         stale = conn.execute('''SELECT count(*) FROM import_proxy_results s
             JOIN proxy_stats h USING(proxy_id)
             WHERE h.youtube_last_import_key IS DISTINCT FROM %s
-                AND s.checked_at <= h.youtube_last_checked_at''', (journal_key,)).fetchone()[0]
+                AND s.checked_at <= h.youtube_last_attempt_at''', (journal_key,)).fetchone()[0]
         if stale:
             raise ValueError(f'Refusing {stale} older or changed results; import immutable journals in chronological order')
         inserted = conn.execute('''
             INSERT INTO proxy_stats AS h
                 (proxy_id,connection_attempts,successful_connections,last_connection_attempt_at,
                  last_connected_at,last_connection_error,
-                 youtube_last_checked_at,youtube_last_attempt_at,working_protocol,
-                 youtube_last_http_status,youtube_last_check_duration_ms,youtube_last_response_at,
+                 youtube_last_attempt_at,working_protocol,
+                 youtube_last_http_status,youtube_last_response_at,
                  youtube_requests_sent,youtube_responses_received,youtube_last_import_key,youtube_last_error)
             SELECT s.proxy_id,s.attempted::integer,s.connected::integer,
                    CASE WHEN s.attempted THEN s.checked_at END,
                    CASE WHEN s.connected THEN s.checked_at END,
                    CASE WHEN s.attempted THEN s.connection_error END,
-                   s.checked_at,CASE WHEN s.attempted THEN s.checked_at END,s.detected_protocol,
-                   s.http_status,s.total_ms,CASE WHEN s.responds THEN s.checked_at END,
+                   CASE WHEN s.attempted THEN s.checked_at END,s.detected_protocol,
+                   s.http_status,CASE WHEN s.responds THEN s.checked_at END,
                    s.requests_sent,s.responds::integer,%s,s.website_error
             FROM import_proxy_results s LEFT JOIN proxy_stats previous USING(proxy_id)
             WHERE previous.youtube_last_import_key IS DISTINCT FROM %s
@@ -130,12 +132,10 @@ def apply_staged(conn, journal_key):
                 last_connection_error=CASE WHEN excluded.last_connection_attempt_at IS NOT NULL
                     AND (h.last_connection_attempt_at IS NULL OR excluded.last_connection_attempt_at>=h.last_connection_attempt_at)
                     THEN excluded.last_connection_error ELSE h.last_connection_error END,
-                youtube_last_checked_at=excluded.youtube_last_checked_at,
                 youtube_last_attempt_at=coalesce(excluded.youtube_last_attempt_at,h.youtube_last_attempt_at),
                 working_protocol=coalesce(excluded.working_protocol,h.working_protocol),
                 youtube_last_http_status=CASE WHEN excluded.youtube_last_attempt_at IS NOT NULL
                     THEN excluded.youtube_last_http_status ELSE h.youtube_last_http_status END,
-                youtube_last_check_duration_ms=excluded.youtube_last_check_duration_ms,
                 youtube_last_response_at=coalesce(excluded.youtube_last_response_at,h.youtube_last_response_at),
                 youtube_last_error=excluded.youtube_last_error,
                 youtube_requests_sent=h.youtube_requests_sent+excluded.youtube_requests_sent,

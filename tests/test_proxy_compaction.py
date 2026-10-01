@@ -136,7 +136,7 @@ class CompactionTests(unittest.TestCase):
             self.assertEqual(self.conn.execute('SELECT successful_connections,last_connected_at=last_connection_attempt_at,last_connection_error FROM proxy_stats').fetchone(),(2,True,'connect:timeout'))
             self.assertEqual(backfill.apply_backfill(self.conn)['updated_proxies'],0)
             # A newer scored data response proves one further connection.
-            self.conn.execute("""UPDATE proxy_stats SET youtube_last_checked_at='2026-01-05Z',youtube_last_response_at='2026-01-05Z',
+            self.conn.execute("""UPDATE proxy_stats SET youtube_last_response_at='2026-01-05Z',
                 youtube_last_attempt_at='2026-01-05Z',last_connection_attempt_at='2026-01-05Z',
                 last_connected_at='2026-01-05Z',last_connection_error=NULL,
                 connection_attempts=connection_attempts+1,successful_connections=successful_connections+1,
@@ -266,7 +266,8 @@ class CompactionTests(unittest.TestCase):
         self.fresh()
         proxy_id=self.proxy()
         with tempfile.TemporaryDirectory() as folder:
-            importer.import_journal(self.conn,self.journal(folder,proxy_id),1)
+            first=self.journal(folder,proxy_id)
+            importer.import_journal(self.conn,first,1)
             path=self.journal(folder,proxy_id,day=4,responds=False)
             result=json.loads(path.read_text())
             result.update(status='invalid_configuration',attempted=False,attempts=[
@@ -279,9 +280,14 @@ class CompactionTests(unittest.TestCase):
             self.assertEqual(importer.import_journal(self.conn,path,1)['new_results'],1)
             self.assertEqual(self.conn.execute('SELECT connection_attempts,youtube_requests_sent,youtube_responses_received,working_protocol FROM proxy_stats').fetchone(),
                              (1,1,1,'socks5'))
-            self.assertEqual(self.conn.execute('SELECT youtube_last_attempt_at<youtube_last_checked_at,youtube_responded,working_protocol FROM proxy_health').fetchone(),
+            self.assertEqual(self.conn.execute("SELECT youtube_last_attempt_at='2026-01-03Z',youtube_responded,working_protocol FROM proxy_health").fetchone(),
                              (True,True,'socks5'))
             self.assertEqual(importer.import_journal(self.conn,path,1)['new_results'],0)
+            # Rejected configurations cannot make historical attempt times look stale.
+            before=self.conn.execute('SELECT * FROM proxy_stats').fetchone()
+            backfill.stage_history(self.conn,[first,path],1)
+            self.assertEqual(backfill.apply_backfill(self.conn)['updated_proxies'],0)
+            self.assertEqual(self.conn.execute('SELECT * FROM proxy_stats').fetchone(),before)
 
     def test_column_migration_rejects_inconsistent_previous_status(self):
         for name in ('001_proxy_lists.sql','002_proxy_entries.sql','003_proxy_tests.sql','004_compact_proxy_database.sql'):

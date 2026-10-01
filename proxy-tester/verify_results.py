@@ -65,7 +65,7 @@ def main():
                     checked_at=datetime.fromisoformat(result['tested_at'].replace('Z','+00:00')).isoformat(),
                     status=result['status'],attempted=result['attempted'],responds=result['responds'],
                     detected_protocol=result.get('detected_protocol'),
-                    http_status=replies[0]['http_status'] if replies else None,total_ms=result['total_ms']))
+                    http_status=replies[0]['http_status'] if replies else None))
             requests = sum(bool(a.get("request_sent")) for a in result["attempts"])
             stability_requests += requests
             multiple_requests += requests > 1
@@ -102,7 +102,7 @@ def main():
                    count(*) FILTER (WHERE youtube_last_http_status IS NOT NULL) AS latest_responding,
                    count(*) FILTER (WHERE youtube_last_response_at IS NOT NULL) AS ever_responding,
                    count(*) FILTER (WHERE youtube_last_response_at IS NOT NULL AND youtube_last_http_status IS NULL) AS intermittent,
-                   min(youtube_last_checked_at) AS earliest_latest_check, max(youtube_last_checked_at) AS latest_check
+                   min(youtube_last_attempt_at) AS earliest_latest_attempt, max(youtube_last_attempt_at) AS latest_attempt
             FROM public.proxy_stats
         """).fetchone()
         checks["catalog_coverage"] = catalog["configurations"] == health["configurations"] == manifest["records"]
@@ -113,21 +113,19 @@ def main():
         checks["latest_responding_count"] = health["latest_responding"] == controller["stability_responses"]
         latest = conn.execute("""
             SELECT count(*) AS configurations,
-                   count(*) FILTER (WHERE h.proxy_id IS NULL OR h.youtube_last_import_key <> %s) AS wrong_latest_round,
+                   count(*) FILTER (WHERE h.proxy_id IS NULL OR h.youtube_last_import_key IS DISTINCT FROM %s) AS wrong_latest_round,
                    count(*) FILTER (WHERE
-                     (h.youtube_last_checked_at,
-                      coalesce(h.youtube_last_attempt_at=h.youtube_last_checked_at,false),
-                      coalesce(h.youtube_last_attempt_at=h.youtube_last_checked_at AND h.youtube_last_http_status IS NOT NULL,false),
-                      CASE WHEN h.youtube_last_attempt_at=h.youtube_last_checked_at AND h.youtube_last_http_status IS NOT NULL
+                     (coalesce(h.youtube_last_attempt_at=r.checked_at,false),
+                      coalesce(h.youtube_last_attempt_at=r.checked_at AND h.youtube_last_http_status IS NOT NULL,false),
+                      CASE WHEN h.youtube_last_attempt_at=r.checked_at AND h.youtube_last_http_status IS NOT NULL
                            THEN h.working_protocol END,
-                      CASE WHEN h.youtube_last_attempt_at=h.youtube_last_checked_at THEN h.youtube_last_http_status END,
-                      h.youtube_last_check_duration_ms)
+                      CASE WHEN h.youtube_last_attempt_at=r.checked_at THEN h.youtube_last_http_status END)
                      IS DISTINCT FROM
-                     (r.checked_at,r.attempted,r.responds,r.detected_protocol,r.http_status,r.total_ms)
+                     (r.attempted,r.responds,r.detected_protocol,r.http_status)
                    ) AS mismatched_latest_result
             FROM jsonb_to_recordset(%s::jsonb) AS r(proxy_id bigint,checked_at timestamptz,
                 status text,attempted boolean,responds boolean,detected_protocol text,
-                http_status smallint,total_ms double precision)
+                http_status smallint)
             LEFT JOIN public.proxy_stats h USING(proxy_id)
         """, (stability_digest.digest(),Jsonb(stability_rows))).fetchone()
         checks['all_responders_rechecked'] = latest['configurations'] == controller['responding_count']
@@ -138,7 +136,7 @@ def main():
         checks['column_counts'] = {row['table_name']: row['n'] for row in conn.execute("""
             SELECT table_name,count(*) AS n FROM information_schema.columns
             WHERE table_schema='public' AND table_name IN ('proxies','proxy_stats','proxy_lists')
-            GROUP BY table_name""")} == {'proxies':6,'proxy_stats':20,'proxy_lists':8}
+            GROUP BY table_name""")} == {'proxies':6,'proxy_stats':18,'proxy_lists':8}
         statuses = conn.execute("""
             SELECT youtube_responded, count(*) AS configurations
             FROM public.proxy_health GROUP BY youtube_responded ORDER BY configurations DESC

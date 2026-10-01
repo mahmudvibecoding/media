@@ -59,7 +59,7 @@ def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connectio
                s.working_protocol,p.connection_settings
         FROM proxies p LEFT JOIN proxy_stats s USING(proxy_id)
         WHERE {where}
-        ORDER BY (s.{site}last_http_status IS NOT NULL) DESC,s.{site}last_check_duration_ms NULLS LAST,
+        ORDER BY (s.{site}last_http_status IS NOT NULL) DESC,
                  s.{site}last_response_at DESC NULLS LAST,p.proxy_id''',
         (identifiers,) if identifiers else ()).fetchall()
     if identifiers and {r[0] for r in rows} != set(identifiers):

@@ -21,10 +21,8 @@ CREATE TABLE public.proxy_stats (
     last_connected_at TIMESTAMPTZ,
     last_connection_error TEXT,
     working_protocol TEXT,
-    youtube_last_checked_at TIMESTAMPTZ,
     youtube_last_attempt_at TIMESTAMPTZ,
     youtube_last_http_status SMALLINT,
-    youtube_last_check_duration_ms DOUBLE PRECISION,
     youtube_last_response_at TIMESTAMPTZ,
     youtube_last_error TEXT,
     youtube_requests_sent BIGINT NOT NULL DEFAULT 0,
@@ -55,13 +53,11 @@ CREATE TABLE public.proxy_stats (
     CONSTRAINT proxy_stats_youtube_http_check CHECK
         (youtube_last_http_status IS NULL OR (youtube_last_http_status BETWEEN 100 AND 599
          AND youtube_last_attempt_at IS NOT NULL)),
-    CONSTRAINT proxy_stats_youtube_duration_check CHECK (youtube_last_check_duration_ms >= 0),
     CONSTRAINT proxy_stats_youtube_error_check CHECK
         (youtube_last_error IS NULL OR youtube_last_error ~ '^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$'),
     CONSTRAINT proxy_stats_youtube_attempt_at_check CHECK
-        (youtube_last_attempt_at IS NULL OR (youtube_last_checked_at IS NOT NULL
-         AND youtube_last_attempt_at <= youtube_last_checked_at
-         AND last_connection_attempt_at IS NOT NULL AND youtube_last_attempt_at <= last_connection_attempt_at)),
+        (youtube_last_attempt_at IS NULL OR (last_connection_attempt_at IS NOT NULL
+         AND youtube_last_attempt_at <= last_connection_attempt_at)),
     CONSTRAINT proxy_stats_youtube_response_at_check CHECK
         ((youtube_responses_received > 0) = (youtube_last_response_at IS NOT NULL)
          AND (youtube_responses_received = 0 OR working_protocol IS NOT NULL)
@@ -78,7 +74,7 @@ CREATE TABLE public.proxy_stats (
          OR (youtube_last_scored_attempt_at IS NOT NULL AND youtube_last_attempt_at IS NOT NULL
              AND youtube_last_scored_attempt_at <= youtube_last_attempt_at AND youtube_weighted_attempts >= 1)),
     CONSTRAINT proxy_stats_youtube_import_check CHECK
-        ((youtube_last_checked_at IS NULL) = (youtube_last_import_key IS NULL)
+        ((youtube_last_attempt_at IS NULL OR youtube_last_import_key IS NOT NULL)
          AND (youtube_last_import_key IS NULL OR octet_length(youtube_last_import_key) = 32))
 );
 CREATE INDEX proxy_stats_youtube_responds_idx ON public.proxy_stats(proxy_id)
@@ -118,10 +114,10 @@ CREATE VIEW public.proxy_health AS
 SELECT p.proxy_id, p.address, p.port,
        s.connection_attempts, s.successful_connections, s.last_connection_attempt_at,
        s.last_connected_at, s.last_connection_error, s.working_protocol,
-       s.youtube_last_checked_at, s.youtube_last_attempt_at,
+       s.youtube_last_attempt_at,
        CASE WHEN s.youtube_last_attempt_at IS NOT NULL
             THEN s.youtube_last_http_status IS NOT NULL END AS youtube_responded,
-       s.youtube_last_http_status, s.youtube_last_check_duration_ms, s.youtube_last_response_at,
+       s.youtube_last_http_status, s.youtube_last_response_at,
        s.youtube_last_error,
        s.youtube_requests_sent, s.youtube_responses_received, s.youtube_successful_data_received,
        coalesce(recent.attempts,0) AS youtube_weighted_attempts,
@@ -162,16 +158,12 @@ COMMENT ON COLUMN public.proxy_stats.last_connection_error IS
     'Proxy endpoint, TLS, authentication or explicit protocol error from the latest actual attempt, as stage:code. Target tunnel, website TLS and response errors stay in the website group. NULL when no proxy-specific error was observed.';
 COMMENT ON COLUMN public.proxy_stats.last_connection_attempt_at IS
     'Completion time of the latest actual connection attempt across websites, including failures and requests reusing a connection. NULL before any attempt.';
-COMMENT ON COLUMN public.proxy_stats.youtube_last_checked_at IS
-    'Latest YouTube check, including rejection before a network attempt. Used with youtube_last_import_key to reject stale or duplicate imports.';
 COMMENT ON COLUMN public.proxy_stats.youtube_last_attempt_at IS
-    'Completion time of the latest actual attempt to use this proxy for YouTube. Unchanged by checks rejected before an attempt.';
+    'Observation time of the latest actual attempt to use this proxy for YouTube. Used with youtube_last_import_key to reject stale or duplicate attempt imports. Unchanged by checks rejected before an attempt.';
 COMMENT ON COLUMN public.proxy_stats.youtube_last_http_status IS
     'HTTP status from the latest actual YouTube attempt, or NULL when no response arrived. A failed connection clears it.';
-COMMENT ON COLUMN public.proxy_stats.youtube_last_check_duration_ms IS
-    'Duration of the latest YouTube check, including a check rejected before a network attempt.';
 COMMENT ON COLUMN public.proxy_stats.youtube_last_error IS
-    'Safe stage:code error from the latest YouTube check: setup, network, HTTP or collector-reported data failure. NULL when successful or unobserved.';
+    'Safe stage:code error from the most recently imported YouTube outcome: setup, network, HTTP or collector-reported data failure. Import rejected configurations in chronological order; their check times are not stored. NULL when successful or unobserved.';
 COMMENT ON COLUMN public.proxy_stats.youtube_requests_sent IS
     'YouTube metadata requests actually sent, excluding proxy negotiation and connection failures before sending.';
 COMMENT ON COLUMN public.proxy_stats.youtube_responses_received IS

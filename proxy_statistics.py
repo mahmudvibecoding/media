@@ -105,7 +105,6 @@ class AttemptOutcome:
     request_sent: bool
     http_status: int | None
     data_received: bool | None
-    duration_ms: float
     connected: bool | None = None
     connection_error: str | None = None
     website_error: str | None = None
@@ -116,8 +115,8 @@ class AttemptOutcome:
         return self.connected is True or self.request_sent or self.http_status is not None
 
     def validate(self):
-        if self.checked_at.tzinfo is None or not math.isfinite(self.duration_ms) or self.duration_ms < 0:
-            raise ValueError('Invalid statistics timestamp or duration')
+        if self.checked_at.tzinfo is None:
+            raise ValueError('Invalid statistics timestamp')
         if type(self.request_sent) is not bool or (self.data_received is not None and type(self.data_received) is not bool):
             raise ValueError('Invalid statistics flags')
         if self.http_status is not None and (type(self.http_status) is not int or not 100 <= self.http_status <= 599):
@@ -149,7 +148,6 @@ class Aggregate:
     first_checked_at: datetime | None = None
     checked_at: datetime | None = None
     last_http_status: int | None = None
-    last_attempt_duration_ms: float = 0.0
     last_response_at: datetime | None = None
     working_protocol: str | None = None
     weighted_attempts: float = 0.0
@@ -169,7 +167,6 @@ class Aggregate:
         if self.checked_at is None or outcome.checked_at >= self.checked_at:
             self.checked_at = outcome.checked_at
             self.last_http_status = outcome.http_status
-            self.last_attempt_duration_ms = outcome.duration_ms
             self.last_connection_error = proxy_connection_error(outcome.connection_error)
             self.last_website_error = outcome.website_error or outcome.connection_error
         if outcome.http_status is not None and (self.last_response_at is None or outcome.checked_at >= self.last_response_at):
@@ -192,7 +189,6 @@ class Aggregate:
         if self.checked_at is None or other.checked_at >= self.checked_at:
             self.checked_at = other.checked_at
             self.last_http_status = other.last_http_status
-            self.last_attempt_duration_ms = other.last_attempt_duration_ms
             self.last_connection_error = other.last_connection_error
             self.last_website_error = other.last_website_error
         if other.last_connected_at is not None:
@@ -209,7 +205,7 @@ class Aggregate:
 
     def row(self, proxy_id):
         return (proxy_id, self.checked_at, self.first_checked_at,
-                self.working_protocol, self.last_http_status, self.last_attempt_duration_ms, self.last_response_at,
+                self.working_protocol, self.last_http_status, self.last_response_at,
                 self.connection_attempts, self.requests_sent, self.responses_received,
                 self.successful_data_received, self.weighted_attempts,
                 self.weighted_successful_data_received, self.last_scored_attempt_at,
@@ -249,7 +245,7 @@ def write_batch(conn, batch):
         conn.execute('''CREATE TEMP TABLE IF NOT EXISTS proxy_statistics_batch (
             proxy_id BIGINT PRIMARY KEY, checked_at TIMESTAMPTZ, first_checked_at TIMESTAMPTZ,
             working_protocol TEXT, last_http_status SMALLINT,
-            last_attempt_duration_ms DOUBLE PRECISION, last_response_at TIMESTAMPTZ,
+            last_response_at TIMESTAMPTZ,
             connection_attempts BIGINT, requests_sent BIGINT, responses_received BIGINT,
             successful_data_received BIGINT, weighted_attempts DOUBLE PRECISION,
             weighted_successful_data_received DOUBLE PRECISION, last_scored_attempt_at TIMESTAMPTZ,
@@ -264,25 +260,25 @@ def write_batch(conn, batch):
             coalesce(sum(s.connection_attempts) FILTER (WHERE h.{site}last_import_key=%s),0),
             coalesce(sum(s.connection_attempts) FILTER
                 (WHERE h.{site}last_import_key IS DISTINCT FROM %s
-                 AND s.first_checked_at<=h.{site}last_checked_at),0)
+                 AND s.first_checked_at<=h.{site}last_attempt_at),0)
             FROM proxy_statistics_batch s JOIN proxy_stats h USING(proxy_id)''', (batch.key, batch.key)).fetchone()
         changed = conn.execute(f'''INSERT INTO proxy_stats AS h
             (proxy_id,connection_attempts,successful_connections,last_connection_attempt_at,
              last_connected_at,last_connection_error,
-             {site}last_checked_at,{site}last_attempt_at,working_protocol,{site}last_http_status,
-             {site}last_check_duration_ms,{site}last_response_at,{site}requests_sent,{site}responses_received,
+             {site}last_attempt_at,working_protocol,{site}last_http_status,
+             {site}last_response_at,{site}requests_sent,{site}responses_received,
              {site}successful_data_received,{site}weighted_attempts,{site}weighted_successful_data_received,
              {site}last_scored_attempt_at,{site}last_import_key,{site}last_error)
             SELECT s.proxy_id,s.connection_attempts,s.successful_connections,s.checked_at,
                    s.last_connected_at,s.last_connection_error,
-                   s.checked_at,s.checked_at,s.working_protocol,s.last_http_status,
-                   s.last_attempt_duration_ms,s.last_response_at,s.requests_sent,s.responses_received,
+                   s.checked_at,s.working_protocol,s.last_http_status,
+                   s.last_response_at,s.requests_sent,s.responses_received,
                    s.successful_data_received,s.weighted_attempts,s.weighted_successful_data_received,
                    s.last_scored_attempt_at,%s,s.last_website_error
             FROM proxy_statistics_batch s LEFT JOIN proxy_stats previous USING(proxy_id)
-            WHERE previous.{site}last_checked_at IS NULL
-               OR (previous.{site}last_import_key IS DISTINCT FROM %s
-                   AND s.first_checked_at>previous.{site}last_checked_at)
+            WHERE previous.{site}last_import_key IS DISTINCT FROM %s
+              AND (previous.{site}last_attempt_at IS NULL
+                   OR s.first_checked_at>previous.{site}last_attempt_at)
             ON CONFLICT (proxy_id) DO UPDATE SET
                 connection_attempts=h.connection_attempts+excluded.connection_attempts,
                 successful_connections=h.successful_connections+excluded.successful_connections,
@@ -291,11 +287,9 @@ def write_batch(conn, batch):
                 last_connection_error=CASE WHEN h.last_connection_attempt_at IS NULL
                     OR excluded.last_connection_attempt_at>=h.last_connection_attempt_at
                     THEN excluded.last_connection_error ELSE h.last_connection_error END,
-                {site}last_checked_at=excluded.{site}last_checked_at,
                 {site}last_attempt_at=excluded.{site}last_attempt_at,
                 working_protocol=coalesce(excluded.working_protocol,h.working_protocol),
                 {site}last_http_status=excluded.{site}last_http_status,
-                {site}last_check_duration_ms=excluded.{site}last_check_duration_ms,
                 {site}last_response_at=coalesce(excluded.{site}last_response_at,h.{site}last_response_at),
                 {site}last_error=excluded.{site}last_error,
                 {site}requests_sent=h.{site}requests_sent+excluded.{site}requests_sent,
