@@ -1,0 +1,19 @@
+[Unit]
+Description=Proxy catalog YouTube connectivity scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/media-proxy-tester
+ExecStart=/usr/bin/python3 -u /opt/media-proxy-tester/controller.py --run 20261001
+Restart=on-failure
+RestartSec=20
+LimitNOFILE=1048576
+TasksMax=infinity
+UMask=0077
+TimeoutStopSec=60
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
