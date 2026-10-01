@@ -261,7 +261,8 @@ def youtube_error_label(result, connection_error):
     return 'request:failed'
 
 
-async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retries=10, *, on_attempt=None):
+async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retries=10, *, on_attempt=None,
+                         total_timeout=None):
     body = json.dumps({"context": {"client": {
         "clientName": "WEB", "clientVersion": client_version, "hl": "en",
     }}, "videoId": video_id}, separators=(",", ":")).encode()
@@ -277,7 +278,7 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
         totals["attempts"] += 1
         totals["request_body_bytes"] += len(body)
         try:
-            async with client.stream("POST", ENDPOINT,
+            async with asyncio.timeout(total_timeout), client.stream("POST", ENDPOINT,
                                      params={"prettyPrint": "false", "fields": FIELD_MASK},
                                      content=body,
                                      extensions={"trace": trace} if trace is not None else None) as response:
@@ -305,7 +306,7 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
                     result["error"] = "YouTube requires sign-in for bot verification"
         except (ResponseShapeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             result.update(status="unexpected_response", error=str(exc))
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, TimeoutError) as exc:
             excluded = (local_worker_error(exc) or (trace is not None and trace.local_failure)
                         or (bridge is not None and bridge.local_error(exc)))
             if trace is not None:
@@ -414,7 +415,7 @@ def metadata_error_reason(result):
         code, message = "INVALID_RESPONSE", result.get("error")
     elif result.get("player_status") and result["player_status"] != "OK":
         code, message = result["player_status"], result.get("player_reason")
-    elif result.get("error") in {"TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}:
+    elif result.get("error") in {"TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}:
         code, message = "TIMEOUT", None
     elif result.get("error"):
         code, message = "REQUEST_ERROR", result["error"]

@@ -80,8 +80,11 @@ def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connectio
 
 class CatalogClients:
     """Create each proxy's HTTP client lazily, reusing clients and a shared CA store."""
-    def __init__(self, proxies, concurrency, binary=DEFAULT_BRIDGE_BINARY):
+    def __init__(self, proxies, concurrency, binary=DEFAULT_BRIDGE_BINARY, *,
+                 connect_timeout=10, request_timeout=20, per_proxy_connections=None):
         self.proxies, self.concurrency, self.binary = proxies, concurrency, Path(binary)
+        self.connect_timeout, self.request_timeout = connect_timeout, request_timeout
+        self.per_proxy_connections = per_proxy_connections or concurrency
         self.process = None
         self._directory = None
         self._clients = {}
@@ -103,7 +106,8 @@ class CatalogClients:
         auth_file.chmod(0o600)
         try:
             self.process = await asyncio.create_subprocess_exec(str(self.binary), 'bridge', '--input', str(manifest),
-                '--auth-file', str(auth_file), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                '--auth-file', str(auth_file), '--connect-timeout', f'{self.connect_timeout:g}s',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             ready = json.loads(await asyncio.wait_for(self.process.stdout.readline(), timeout=30))
             host, port = ready['address'].rsplit(':', 1)
             if (ready.get('event') != 'ready' or host != '127.0.0.1' or not 0 < int(port) < 65536
@@ -128,8 +132,9 @@ class CatalogClients:
             client = httpx.AsyncClient(http2=True, trust_env=False, follow_redirects=False,
                 proxy=httpx.Proxy('http://' + self._address, auth=(str(proxy.proxy_id), self._token)),
                 verify=self._tls, headers={'Content-Type': 'application/json', 'Accept-Encoding': 'gzip'},
-                timeout=httpx.Timeout(20, connect=10),
-                limits=httpx.Limits(max_connections=self.concurrency, max_keepalive_connections=self.concurrency))
+                timeout=httpx.Timeout(self.request_timeout, connect=self.connect_timeout),
+                limits=httpx.Limits(max_connections=self.per_proxy_connections,
+                                   max_keepalive_connections=self.per_proxy_connections))
             client.catalog_bridge = self
             self._clients[index] = client
         return self._clients[index]

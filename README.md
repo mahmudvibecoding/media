@@ -238,6 +238,81 @@ error and moves on to the next video. Concurrency remains 128
 across all proxies combined. Connections are reused separately for each proxy.
 Proxy URLs and credentials are not written to the run summary.
 
+### Resumable collection on a separate server
+
+`metadata_bulk.py` exports pending videos and all supported proxy configurations
+that previously received a YouTube response. Server workers keep a durable SQLite
+queue and write immutable, checksummed result batches. `metadata_bulk_import.py`
+copies those batches back and updates the local `media` and `proxy` databases.
+PostgreSQL stays local; the server does not need database access.
+
+Export a new snapshot into a new directory:
+
+```sh
+.venv/bin/python metadata_bulk.py export --output outputs/metadata-run
+```
+
+Copy that directory to the server. Install the repository's Python requirements
+there and build `proxy-tester` for the server's architecture at
+`.local/bin/proxy-tester`. Keep the Python modules together so their imports and
+relative paths work. Snapshot files contain proxy credentials and must remain
+private. The commands create new files with mode `0600` by default.
+
+Initialize and start from the server's checkout:
+
+```sh
+.venv/bin/python metadata_bulk.py init --run /path/to/metadata-run \
+  --workers 8 --concurrency 128 --max-attempts 3
+.venv/bin/python metadata_bulk.py run --run /path/to/metadata-run
+```
+
+The concurrency argument is per worker: these defaults allow 1,024 simultaneous
+requests. Each proxy belongs to one worker and has at most one active request.
+Workers first try their unused configurations, then reuse successful ones more
+often. Repeatedly failing configurations become less eligible for fresh work.
+Connection setup has a five-second timeout; the entire request has a twenty-second
+deadline. There are no retries inside an individual request.
+
+Videos without previous errors come first. Failed videos enter a recovery round
+after the initial queue finishes. Recovery uses configurations that returned
+metadata when that worker has any. It avoids the previous proxy when another is
+available. Each video gets up to the configured number of network attempts; local
+worker failures do not affect proxy statistics. Five local failures leave a final
+video error so the queue cannot loop indefinitely.
+
+Run the importer on the computer holding PostgreSQL. Use the `run_id` from the
+snapshot's `manifest.json`:
+
+```sh
+.venv/bin/python metadata_bulk_import.py --host USER@SERVER \
+  --remote /path/to/metadata-run --local outputs/metadata-import \
+  --run-id RUN_UUID
+```
+
+The importer needs `ssh` and `rsync`, holds the regular metadata collector's
+advisory lock, and imports batches in sequence. It verifies checksums, video IDs,
+proxy identities, and outcome classifications before writing. Successful metadata
+commits before its statistics batch; after a lost acknowledgement, replay skips
+already saved videos and uses the batch digest to prevent repeated statistics.
+Missing metadata fields preserve existing values. Only a video's final failure
+updates `metadata_error`. A database or SSH outage leaves server results available
+for the next import attempt. A checksum, identity, sequence, or statistics ordering
+conflict stops the importer for inspection.
+
+Monitor `status.json` on the server and `import-status.json` locally. The former
+reports queue counts, attempts, metadata successes, tested configurations and
+recent successful saves per second. The latter includes committed database saves
+and its last imported event. Import is complete only when the server queue is
+complete and every exported event has been imported.
+
+Change `concurrency_per_worker` in `control.json` atomically to tune throughput
+(1–1,024 per worker). Set `stop` to `true` or send `SIGTERM` to the controller to
+drain active requests. Run the same `run` command to resume; do not initialize the
+queue again. A restarted worker recovers only its own outstanding leases. Keep
+the queue, input snapshot, outbox and import cursor until the final database audit
+is complete. Run the controller and importer under process supervision for long
+collections.
+
 ### Use saved proxy configurations
 
 Build the transport bridge once with the existing Go tester dependencies:
