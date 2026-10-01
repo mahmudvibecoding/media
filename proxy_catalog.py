@@ -13,6 +13,7 @@ import httpx
 import psycopg
 
 from proxy_statistics import ProxyTarget, website_prefix
+from proxy_formats import unpack_connection_settings
 
 
 ROOT = Path(__file__).resolve().parent
@@ -27,7 +28,7 @@ class CatalogProxy:
     connection_key: bytes
     address: str
     port: int
-    protocol: str
+    transport: str
     working_protocol: str
     settings: dict = field(repr=False)
 
@@ -37,7 +38,7 @@ class CatalogProxy:
 
     def bridge_record(self):
         return dict(id=self.proxy_id, key=self.connection_key.hex(), address=self.address, port=self.port,
-                    protocol=self.protocol, working_protocol=self.working_protocol, settings=self.settings)
+                    protocol=self.transport, working_protocol=self.working_protocol, settings=self.settings)
 
 
 def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connection=None):
@@ -54,8 +55,8 @@ def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connectio
     if not chosen_protocols <= SUPPORTED_PROTOCOLS:
         raise ValueError('Unsupported catalog protocol selection')
     where = 'p.proxy_id=ANY(%s)' if identifiers else f's.{site}last_response_at IS NOT NULL'
-    rows = connection.execute(f'''SELECT p.proxy_id,p.connection_key,p.address,p.port,p.protocol,
-               coalesce(s.{site}working_protocol,p.protocol),p.connection_settings
+    rows = connection.execute(f'''SELECT p.proxy_id,p.connection_key,p.address,p.port,
+               s.working_protocol,p.connection_settings
         FROM proxies p LEFT JOIN proxy_stats s USING(proxy_id)
         WHERE {where}
         ORDER BY (s.{site}last_http_status IS NOT NULL) DESC,s.{site}last_check_duration_ms NULLS LAST,
@@ -64,16 +65,14 @@ def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connectio
     if identifiers and {r[0] for r in rows} != set(identifiers):
         raise ValueError('A selected proxy ID is missing from the catalog')
     result = []
-    for proxy_id, key, address, port, declared, working, settings in rows:
+    for proxy_id, key, address, port, working, configuration in rows:
+        transport, settings = unpack_connection_settings(configuration)
+        working = working or transport
         if working not in chosen_protocols:
             if identifiers:
                 raise ValueError(f'Selected proxy {proxy_id} has no supported selected protocol')
             continue
-        if isinstance(settings, str):
-            settings = json.loads(settings)
-        if not isinstance(settings, dict):
-            raise ValueError(f'Invalid settings for catalog proxy {proxy_id}')
-        result.append(CatalogProxy(proxy_id, bytes(key), address, port, declared, working, settings))
+        result.append(CatalogProxy(proxy_id, bytes(key), address, port, transport, working, settings))
     if not result:
         raise ValueError('No compatible catalog configurations matched')
     return result

@@ -12,11 +12,15 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 
 import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from proxy_statistics import proxy_connection_error
+
 COLUMNS = ('proxy_id,connection_key,checked_at,status,attempted,responds,'
            'declared_protocol,detected_protocol,http_status,total_ms,requests_sent,'
            'connected,connection_error,website_error')
@@ -39,13 +43,11 @@ def connection_observation(result):
     last = attempts[-1] if attempts else {}
     stage, code = last.get('stage'), last.get('error_code')
     if result['responds']:
-        stage, code = 'youtube_body', last.get('body_error')
-        if code in ('gzip_decode_error', 'body_too_large'):
-            code = None
+        stage, code = None, None
     error = f'{stage}:{code}' if stage and code else None
     if error is not None and re.fullmatch(r'[a-z][a-z0-9_]*:[a-z][a-z0-9_]*', error) is None:
         raise ValueError('Invalid connection error label in journal')
-    return connected, error
+    return connected, proxy_connection_error(error)
 
 
 def website_error(result, connection_error):
@@ -53,6 +55,8 @@ def website_error(result, connection_error):
     error = connection_error
     if error is None and last.get('body_error'):
         error = 'youtube_body:' + last['body_error']
+    if error is None and not result['responds'] and last.get('stage') and last.get('error_code'):
+        error = last['stage'] + ':' + last['error_code']
     if error is None and result['responds'] and last.get('http_status', 0) >= 300:
         error = 'http:http_' + str(last['http_status'])
     if error is not None and re.fullmatch(r'[a-z][a-z0-9_]*:[a-z][a-z0-9_]*', error) is None:
@@ -93,7 +97,7 @@ def apply_staged(conn, journal_key):
         mismatches = conn.execute('''SELECT count(*) FROM import_proxy_results s
             LEFT JOIN proxies p USING(proxy_id)
             WHERE p.proxy_id IS NULL OR p.connection_key <> s.connection_key
-               OR p.protocol <> s.declared_protocol''').fetchone()[0]
+               OR p.connection_settings->>'transport' IS DISTINCT FROM s.declared_protocol''').fetchone()[0]
         if mismatches:
             raise ValueError(f'Refusing import: {mismatches} configurations do not match this catalog')
         stale = conn.execute('''SELECT count(*) FROM import_proxy_results s
@@ -106,7 +110,7 @@ def apply_staged(conn, journal_key):
             INSERT INTO proxy_stats AS h
                 (proxy_id,connection_attempts,successful_connections,last_connection_attempt_at,
                  last_connected_at,last_connection_error,
-                 youtube_last_checked_at,youtube_last_attempt_at,youtube_working_protocol,
+                 youtube_last_checked_at,youtube_last_attempt_at,working_protocol,
                  youtube_last_http_status,youtube_last_check_duration_ms,youtube_last_response_at,
                  youtube_requests_sent,youtube_responses_received,youtube_last_import_key,youtube_last_error)
             SELECT s.proxy_id,s.attempted::integer,s.connected::integer,
@@ -128,7 +132,7 @@ def apply_staged(conn, journal_key):
                     THEN excluded.last_connection_error ELSE h.last_connection_error END,
                 youtube_last_checked_at=excluded.youtube_last_checked_at,
                 youtube_last_attempt_at=coalesce(excluded.youtube_last_attempt_at,h.youtube_last_attempt_at),
-                youtube_working_protocol=coalesce(excluded.youtube_working_protocol,h.youtube_working_protocol),
+                working_protocol=coalesce(excluded.working_protocol,h.working_protocol),
                 youtube_last_http_status=CASE WHEN excluded.youtube_last_attempt_at IS NOT NULL
                     THEN excluded.youtube_last_http_status ELSE h.youtube_last_http_status END,
                 youtube_last_check_duration_ms=excluded.youtube_last_check_duration_ms,

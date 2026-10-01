@@ -9,12 +9,15 @@ import json
 import os
 from pathlib import Path
 import random
+import sys
 import time
 
 import psycopg
 
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from proxy_formats import unpack_connection_settings
 
 
 def encoded(record):
@@ -71,21 +74,19 @@ def main():
         manifest["expected_records"] = expected
         with conn.cursor(name="proxy_snapshot") as cursor:
             cursor.itersize = 10_000
-            cursor.execute("SELECT proxy_id, encode(connection_key, 'hex'), address, port, protocol, "
+            cursor.execute("SELECT proxy_id, encode(connection_key, 'hex'), address, port, "
                            "connection_settings FROM public.proxies ORDER BY proxy_id")
-            for proxy_id, key, address, port, protocol, settings in cursor:
+            for proxy_id, key, address, port, configuration in cursor:
                 if compressed is None:
                     filename = f"catalog-{len(manifest['shards']):04d}.jsonl.gz"
                     temporary = args.output / (filename + ".tmp")
                     raw = temporary.open("xb")
                     compressed = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1, mtime=0)
                     manifest["shards"].append({"file": filename, "records": 0})
-                if isinstance(settings, str):
-                    try:
-                        settings = json.loads(settings)
-                    except (ValueError, TypeError):
-                        settings = {"_invalid_settings": True}
-                if not isinstance(settings, dict):
+                try:
+                    protocol, settings = unpack_connection_settings(configuration)
+                except ValueError:
+                    protocol = configuration.get('transport', 'unknown')
                     settings = {"_invalid_settings": True}
                 record = {"id": proxy_id, "key": key, "address": address, "port": port,
                           "protocol": protocol, "settings": settings}

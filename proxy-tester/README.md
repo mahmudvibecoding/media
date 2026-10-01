@@ -77,17 +77,23 @@ configuration IDs, identity hashes, timing, and response classifications;
 response bodies and credentials are not saved in results.
 
 The current schema is [db/proxy/schema.sql](../db/proxy/schema.sql): three tables
-with 35 stored columns, including 20 in `proxy_stats`. There is one statistics
+with 34 stored columns, including 20 in `proxy_stats`. There is one statistics
 row per configuration, with shared connection fields and a fixed `youtube_*`
 column group. Individual test history stays in the retained journals.
 Existing databases must apply missing [proxy migrations](../db/README.md#proxy-schema-migrations)
-through [migration 008](../db/proxy/migrations/008_proxy_website_columns.sql)
+through [migration 009](../db/proxy/migrations/009_shared_proxy_protocol.sql)
 before using the current importer. Fresh databases use the current schema file.
 Import an immutable finished journal with its metadata and final summary beside it:
 
 ```sh
 .venv/bin/python proxy-tester/import_results.py /path/to/new/results.jsonl.gz
 ```
+
+The separate `proxies.protocol` column has been removed. Exports obtain the
+input transport from `connection_settings.transport` and decode its `options`.
+The server's catalog and journal formats remain compatible, including the
+journal's `declared_protocol` field. The importer checks that value against the
+saved transport and verifies the unchanged proxy ID and identity hash.
 
 Compressed files keep sidecars named `results.jsonl.meta.json` and
 `results.jsonl.summary.json`, plus `results.jsonl.sealed.json` when available.
@@ -106,8 +112,9 @@ history is deleted. Import ordering uses `youtube_last_checked_at` independently
 of shared connection timestamps.
 
 Shared statistics retain `connection_attempts`, `successful_connections`,
-`last_connection_attempt_at`, `last_connected_at`, and `last_connection_error`.
-YouTube has its own check and attempt timestamps, working protocol, HTTP status,
+`last_connection_attempt_at`, `last_connected_at`, `last_connection_error`, and
+`working_protocol`. The confirmed protocol is shared across websites.
+YouTube has its own check and attempt timestamps, HTTP status,
 duration, last response, error, counters and scoring inputs. See the
 [field reference](../db/README.md#youtube-columns) for their exact names.
 
@@ -125,11 +132,11 @@ best-effort background writer. See [proxy scoring](../db/README.md#recent-proxy-
 
 A check counts as connected when any of its protocol attempts confirms a proxy
 connection. Trying several handshakes still adds at most one successful connection
-per check. `last_connection_error` holds the latest actual attempt's network
-failure as a safe `stage:code` label. YouTube HTTP errors and missing metadata do
-not set that field. `youtube_last_error` can also record setup, response-body,
-HTTP and collector-reported data failures. A check rejected before an actual
-attempt updates the website's check details while preserving the shared
+per check. `last_connection_error` holds the latest actual attempt's proxy
+endpoint, TLS, authentication or explicit protocol failure as a safe `stage:code`
+label. Target-tunnel refusals, ambiguous adapter errors, website TLS and body
+failures go to `youtube_last_error`, along with HTTP and data failures. A check
+rejected before an actual attempt updates the website's check details while preserving the shared
 connection fields and the previous actual YouTube attempt.
 Historical missing observations remain unknown. The retained journals can
 initialize older missing connection observations without replaying other
@@ -149,15 +156,15 @@ This reads one consistent database snapshot, compares cumulative totals with
 all saved summaries, and checks latest values against the final stability
 journal. Run it against a snapshot matching that fixed run; later tests and
 metadata collection change the expected totals.
-The script's column references were updated for migration 008, but it was not
-rerun after that migration. Individual per-round database history is no longer
-available.
+The script's column references follow the current schema. Its fixed historical
+comparison has not been rerun after the schema changes. Individual per-round
+database history is no longer available.
 
 Useful SQL in the `proxy` database:
 
 ```sql
 -- Configurations that responded in their latest actual YouTube attempt.
-SELECT proxy_id, address, port, declared_protocol, youtube_working_protocol,
+SELECT proxy_id, address, port, working_protocol,
        youtube_last_attempt_at, youtube_last_http_status, youtube_responses_received
 FROM proxy_health
 WHERE youtube_responded IS TRUE

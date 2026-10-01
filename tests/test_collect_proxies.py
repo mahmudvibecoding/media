@@ -151,7 +151,7 @@ class DatabaseTests(unittest.TestCase):
         self.conn.execute('SET LOCAL search_path TO ' + schema + ',public')
         ddl = (Path(__file__).resolve().parents[1] / 'db/proxy/schema.sql').read_text()
         self.conn.execute(ddl.replace('public.',schema+'.'))
-        self.conn.execute('CREATE TEMP TABLE proxy_stage (connection_key BYTEA PRIMARY KEY, address TEXT, port INTEGER, protocol TEXT, connection_settings JSONB) ON COMMIT DELETE ROWS')
+        self.conn.execute('CREATE TEMP TABLE proxy_stage (connection_key BYTEA PRIMARY KEY, address TEXT, port INTEGER, connection_settings JSONB) ON COMMIT DELETE ROWS')
         self.store = Store.__new__(Store)
         self.store.control = self.store.writer = self.conn
         self.store.run_id = uuid.uuid4()
@@ -179,9 +179,10 @@ class DatabaseTests(unittest.TestCase):
 
     def test_binary_settings_round_trip(self):
         original = {'prefix\x00key':'\x16\x03\x00','nested':{'ordinary':'value'}}
-        stored = self.conn.execute('SELECT %s::jsonb AS settings',(stored_settings(original),)).fetchone()['settings']
-        self.assertIsInstance(stored,str)
-        self.assertEqual(json.loads(stored),original)
+        stored = self.conn.execute('SELECT %s::jsonb AS settings',(stored_settings(original,'vless'),)).fetchone()['settings']
+        self.assertEqual(stored['transport'],'vless')
+        self.assertIsInstance(stored['options'],str)
+        self.assertEqual(json.loads(stored['options']),original)
 
     def test_deduplication_reparse_and_atomic_failure(self):
         self.add_list('https://test.invalid/a')

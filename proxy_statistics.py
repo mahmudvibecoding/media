@@ -27,6 +27,18 @@ ROOT = Path(__file__).resolve().parent
 IMPORT_LOCK = 6389247650123
 HALF_LIFE_SECONDS = 3600.0
 WEBSITES = frozenset({'youtube'})
+# Target tunnel refusals and ambiguous adapter errors belong to the website.
+# Only observations that identify the proxy endpoint, TLS or authentication
+# can set the shared connection error. Keep the database check in sync.
+CONNECTION_ERROR_PATTERN = (
+    r'(?:(?:resolve|connect|proxy_tls):[a-z][a-z0-9_]*'
+    r'|proxy_handshake:(?:proxy_authentication_required|proxy_authentication_failed|proxy_http_407'
+    r'|not_socks5|invalid_socks5_address|socks4_reply_92|socks4_reply_93|socks5_reply_7|socks5_reply_8))'
+)
+
+
+def proxy_connection_error(error):
+    return error if error is not None and re.fullmatch(CONNECTION_ERROR_PATTERN, error) else None
 
 
 def website_prefix(website):
@@ -158,7 +170,7 @@ class Aggregate:
             self.checked_at = outcome.checked_at
             self.last_http_status = outcome.http_status
             self.last_attempt_duration_ms = outcome.duration_ms
-            self.last_connection_error = outcome.connection_error
+            self.last_connection_error = proxy_connection_error(outcome.connection_error)
             self.last_website_error = outcome.website_error or outcome.connection_error
         if outcome.http_status is not None and (self.last_response_at is None or outcome.checked_at >= self.last_response_at):
             self.last_response_at, self.working_protocol = outcome.checked_at, protocol
@@ -257,7 +269,7 @@ def write_batch(conn, batch):
         changed = conn.execute(f'''INSERT INTO proxy_stats AS h
             (proxy_id,connection_attempts,successful_connections,last_connection_attempt_at,
              last_connected_at,last_connection_error,
-             {site}last_checked_at,{site}last_attempt_at,{site}working_protocol,{site}last_http_status,
+             {site}last_checked_at,{site}last_attempt_at,working_protocol,{site}last_http_status,
              {site}last_check_duration_ms,{site}last_response_at,{site}requests_sent,{site}responses_received,
              {site}successful_data_received,{site}weighted_attempts,{site}weighted_successful_data_received,
              {site}last_scored_attempt_at,{site}last_import_key,{site}last_error)
@@ -281,7 +293,7 @@ def write_batch(conn, batch):
                     THEN excluded.last_connection_error ELSE h.last_connection_error END,
                 {site}last_checked_at=excluded.{site}last_checked_at,
                 {site}last_attempt_at=excluded.{site}last_attempt_at,
-                {site}working_protocol=coalesce(excluded.{site}working_protocol,h.{site}working_protocol),
+                working_protocol=coalesce(excluded.working_protocol,h.working_protocol),
                 {site}last_http_status=excluded.{site}last_http_status,
                 {site}last_check_duration_ms=excluded.{site}last_check_duration_ms,
                 {site}last_response_at=coalesce(excluded.{site}last_response_at,h.{site}last_response_at),

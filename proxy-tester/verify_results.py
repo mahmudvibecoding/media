@@ -119,7 +119,7 @@ def main():
                       coalesce(h.youtube_last_attempt_at=h.youtube_last_checked_at,false),
                       coalesce(h.youtube_last_attempt_at=h.youtube_last_checked_at AND h.youtube_last_http_status IS NOT NULL,false),
                       CASE WHEN h.youtube_last_attempt_at=h.youtube_last_checked_at AND h.youtube_last_http_status IS NOT NULL
-                           THEN h.youtube_working_protocol END,
+                           THEN h.working_protocol END,
                       CASE WHEN h.youtube_last_attempt_at=h.youtube_last_checked_at THEN h.youtube_last_http_status END,
                       h.youtube_last_check_duration_ms)
                      IS DISTINCT FROM
@@ -138,15 +138,15 @@ def main():
         checks['column_counts'] = {row['table_name']: row['n'] for row in conn.execute("""
             SELECT table_name,count(*) AS n FROM information_schema.columns
             WHERE table_schema='public' AND table_name IN ('proxies','proxy_stats','proxy_lists')
-            GROUP BY table_name""")} == {'proxies':7,'proxy_stats':20,'proxy_lists':8}
+            GROUP BY table_name""")} == {'proxies':6,'proxy_stats':20,'proxy_lists':8}
         statuses = conn.execute("""
             SELECT youtube_responded, count(*) AS configurations
             FROM public.proxy_health GROUP BY youtube_responded ORDER BY configurations DESC
         """).fetchall()
         response_protocols = conn.execute("""
-            SELECT youtube_working_protocol AS detected_protocol, count(*) AS configurations
+            SELECT working_protocol AS detected_protocol, count(*) AS configurations
             FROM public.proxy_stats WHERE youtube_last_http_status IS NOT NULL
-            GROUP BY youtube_working_protocol ORDER BY configurations DESC
+            GROUP BY working_protocol ORDER BY configurations DESC
         """).fetchall()
         response_statuses = conn.execute("""
             SELECT youtube_last_http_status AS http_status, count(*) AS configurations

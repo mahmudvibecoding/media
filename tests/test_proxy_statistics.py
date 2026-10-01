@@ -22,7 +22,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from collect_video_metadata import collect, fetch_metadata, fetch_metadata_with_proxies, RequestTrace, save_metadata
-from proxy_formats import Proxy
+from proxy_formats import Proxy, pack_connection_settings
 from proxy_statistics import Aggregate, AttemptOutcome, ProxyStatistics, ProxyTarget, StatisticsBatch, decayed_weight, write_batch
 
 
@@ -76,9 +76,9 @@ class WeightTests(unittest.TestCase):
         for success in [True]*2 + [False]*8:
             aggregate.add(outcome(T+timedelta(hours=1), success), 'http')
         self.assertEqual(aggregate.connection_attempts, 20)
-        self.assertEqual(aggregate.youtube_successful_data_received, 10)
-        self.assertAlmostEqual(aggregate.weighted_connection_attempts, 15)
-        self.assertAlmostEqual(aggregate.weighted_youtube_successful_data_received, 6)
+        self.assertEqual(aggregate.successful_data_received, 10)
+        self.assertAlmostEqual(aggregate.weighted_attempts, 15)
+        self.assertAlmostEqual(aggregate.weighted_successful_data_received, 6)
         self.assertAlmostEqual(100*(6+1)/(15+2), 41.17647058823529)
 
     def test_out_of_order_completions_and_merged_batches_have_the_same_weights(self):
@@ -89,15 +89,15 @@ class WeightTests(unittest.TestCase):
         for item in reversed(observations):
             merged.merge(batch(item).aggregates[TARGET])
         self.assertEqual(together, merged)
-        self.assertAlmostEqual(together.weighted_connection_attempts, 1.75)
-        self.assertAlmostEqual(together.weighted_youtube_successful_data_received, .75)
+        self.assertAlmostEqual(together.weighted_attempts, 1.75)
+        self.assertAlmostEqual(together.weighted_successful_data_received, .75)
 
     def test_unknown_data_quality_changes_reachability_only(self):
         result = batch(outcome(success=None)).aggregates[TARGET]
-        self.assertEqual((result.connection_attempts, result.youtube_responses_received), (1,1))
-        self.assertEqual(result.youtube_successful_data_received, 0)
+        self.assertEqual((result.connection_attempts, result.responses_received), (1,1))
+        self.assertEqual(result.successful_data_received, 0)
         self.assertIsNone(result.last_scored_attempt_at)
-        self.assertEqual(result.weighted_connection_attempts, 0)
+        self.assertEqual(result.weighted_attempts, 0)
 
     def test_very_old_or_zero_evidence_is_safe_and_clock_reversal_does_not_inflate_it(self):
         self.assertEqual(decayed_weight(1,T,T+timedelta(days=1000)), 0)
@@ -122,8 +122,8 @@ class CollectorStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([o.data_received for o in observed], [False,False,False,True])
         self.assertEqual([o.request_sent for o in observed], [False,True,True,True])
         aggregate = batch(*observed).aggregates[TARGET]
-        self.assertEqual((aggregate.connection_attempts,aggregate.youtube_requests_sent,
-                          aggregate.youtube_responses_received,aggregate.youtube_successful_data_received), (4,3,3,1))
+        self.assertEqual((aggregate.connection_attempts,aggregate.requests_sent,
+                          aggregate.responses_received,aggregate.successful_data_received), (4,3,3,1))
 
     async def test_sent_request_followed_by_timeout_is_still_counted_as_sent(self):
         async def handle(request):
@@ -430,7 +430,17 @@ class WireTracingTests(unittest.IsolatedAsyncioTestCase):
             await fetch_metadata(client,VIDEO,retries=0,on_attempt=observed.append)
         self.assertTrue(observed[0].connected)
         self.assertFalse(observed[0].request_sent)
-        self.assertEqual(observed[0].connection_error,'youtube_https:youtube_certificate_verification_failed')
+        self.assertIsNone(observed[0].connection_error)
+        self.assertEqual(observed[0].website_error,'youtube_https:youtube_certificate_verification_failed')
+
+    async def test_target_tunnel_refusal_stays_in_website_error(self):
+        self.reject_response=b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
+        observed=[]
+        async with httpx.AsyncClient(proxy=self.proxy_url,trust_env=False) as client:
+            await fetch_metadata(client,VIDEO,retries=0,on_attempt=observed.append)
+        self.assertTrue(observed[0].connected)
+        self.assertIsNone(observed[0].connection_error)
+        self.assertEqual(observed[0].website_error,'proxy_handshake:proxy_http_403')
 
     async def test_bridge_loopback_does_not_count_as_the_upstream_connection(self):
         for connected,label in ((False,'connect:connection_refused'),(True,'proxy_handshake:proxy_http_407')):
@@ -476,18 +486,23 @@ class StatisticsDatabaseTests(unittest.TestCase):
     def fresh(self):
         ddl(self.conn,self.schema,'schema.sql')
 
-    def proxy(self,protocol='http',settings=None,address='8.8.8.8'):
+    def proxy(self,protocol='http',settings=None,address='8.8.8.8',legacy=False):
         p=Proxy(address,8080,protocol,settings or {})
+        if legacy:
+            return self.conn.execute('''INSERT INTO proxies
+                (connection_key,address,port,protocol,connection_settings,last_seen_at)
+                VALUES (%s,%s,%s,%s,%s,%s) RETURNING proxy_id''',
+                (p.key,p.address,p.port,p.protocol,Jsonb(p.settings),T)).fetchone()[0]
         return self.conn.execute('''INSERT INTO proxies
-            (connection_key,address,port,protocol,connection_settings,last_seen_at)
-            VALUES (%s,%s,%s,%s,%s,%s) RETURNING proxy_id''',
-            (p.key,p.address,p.port,p.protocol,Jsonb(p.settings),T)).fetchone()[0]
+            (connection_key,address,port,connection_settings,last_seen_at)
+            VALUES (%s,%s,%s,%s,%s) RETURNING proxy_id''',
+            (p.key,p.address,p.port,Jsonb(pack_connection_settings(p.protocol,p.settings)),T)).fetchone()[0]
 
     def test_migration_preserves_all_old_values_and_leaves_history_unscored(self):
         for name in ('001_proxy_lists.sql','002_proxy_entries.sql','003_proxy_tests.sql',
                      '004_compact_proxy_database.sql','005_reduce_proxy_columns.sql'):
             ddl(self.conn,self.schema,'migrations/'+name)
-        proxy_id=self.proxy()
+        proxy_id=self.proxy(legacy=True)
         self.conn.execute('''INSERT INTO proxy_stats VALUES
             (%s,%s,'responds','http',200,20,%s,10,8,7,%s)''',(proxy_id,T,T,b'x'*32))
         before=self.conn.execute('SELECT * FROM proxy_stats').fetchone()
@@ -537,11 +552,11 @@ class StatisticsDatabaseTests(unittest.TestCase):
         self.fresh()
         self.proxy()
         write_batch(self.conn,batch(outcome(success=None)))
-        self.assertEqual(self.conn.execute('SELECT score,youtube_successful_data_received FROM proxy_health').fetchone(),(None,0))
+        self.assertEqual(self.conn.execute('SELECT youtube_score,youtube_successful_data_received FROM proxy_health').fetchone(),(None,0))
         write_batch(self.conn,batch(outcome(T+timedelta(hours=1))))
-        before=self.conn.execute('SELECT last_scored_attempt_at,weighted_connection_attempts FROM proxy_stats').fetchone()
+        before=self.conn.execute('SELECT youtube_last_scored_attempt_at,youtube_weighted_attempts FROM proxy_stats').fetchone()
         write_batch(self.conn,batch(outcome(T+timedelta(hours=2),None)))
-        self.assertEqual(self.conn.execute('SELECT last_scored_attempt_at,weighted_connection_attempts FROM proxy_stats').fetchone(),before)
+        self.assertEqual(self.conn.execute('SELECT youtube_last_scored_attempt_at,youtube_weighted_attempts FROM proxy_stats').fetchone(),before)
         self.assertEqual(self.conn.execute('SELECT youtube_successful_data_received FROM proxy_stats').fetchone()[0],1)
 
     def test_python_and_sql_decay_agree_and_view_ages_evidence_without_writes(self):
@@ -553,15 +568,15 @@ class StatisticsDatabaseTests(unittest.TestCase):
             self.assertAlmostEqual(actual,decayed_weight(weight,T,at))
         now=datetime.now(timezone.utc)
         write_batch(self.conn,batch(outcome(now-timedelta(hours=1))))
-        stored=self.conn.execute('SELECT weighted_connection_attempts FROM proxy_stats').fetchone()[0]
-        attempts,successes,score,age=self.conn.execute('''SELECT weighted_connection_attempts,
-            weighted_youtube_successful_data_received,score,score_age_seconds FROM proxy_health''').fetchone()
+        stored=self.conn.execute('SELECT youtube_weighted_attempts FROM proxy_stats').fetchone()[0]
+        attempts,successes,youtube_score,age=self.conn.execute('''SELECT youtube_weighted_attempts,
+            youtube_weighted_successful_data_received,youtube_score,youtube_score_age_seconds FROM proxy_health''').fetchone()
         self.assertEqual(stored,1)
         self.assertAlmostEqual(attempts,.5,places=3)
         self.assertAlmostEqual(successes,.5,places=3)
-        self.assertAlmostEqual(score,60,places=2)
+        self.assertAlmostEqual(youtube_score,60,places=2)
         self.assertGreaterEqual(age,3600)
-        self.assertEqual(self.conn.execute('SELECT weighted_connection_attempts FROM proxy_stats').fetchone()[0],1)
+        self.assertEqual(self.conn.execute('SELECT youtube_weighted_attempts FROM proxy_stats').fetchone()[0],1)
 
     def test_credentials_and_ambiguous_aliases_cannot_mix_configurations(self):
         self.fresh()
@@ -605,7 +620,7 @@ class StatisticsDatabaseTests(unittest.TestCase):
         self.fresh()
         self.proxy()
         value=batch(outcome())
-        value.aggregates[TARGET].youtube_successful_data_received=2
+        value.aggregates[TARGET].successful_data_received=2
         with self.assertRaises(psycopg.errors.CheckViolation):
             write_batch(self.conn,value)
         self.assertEqual(self.conn.execute('SELECT count(*) FROM proxy_stats').fetchone()[0],0)

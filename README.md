@@ -263,11 +263,12 @@ To select particular catalog IDs or working protocols:
 .venv/bin/python collect_video_metadata.py --proxy-catalog --proxy-protocol vless
 ```
 
-Catalog IDs use the full stored connection settings. `youtube_working_protocol`
-takes precedence over the source's declared label. Explicit IDs without a known
-working protocol can use their declared supported protocol. Configurations with
-an unknown protocol need a connectivity check before catalog collection can use
-them. Catalog options and `MEDIA_PROXY_URL(S)` are mutually exclusive.
+Catalog IDs use the full stored connection settings. The shared `working_protocol`
+takes precedence over the configured transport in `connection_settings`.
+Explicit IDs without a confirmed working protocol can use that configured
+transport. Configurations with an unknown protocol need a connectivity check
+before catalog collection can use them. Catalog options and `MEDIA_PROXY_URL(S)`
+are mutually exclusive.
 
 ```text
 Python metadata collector → authenticated loopback CONNECT bridge
@@ -310,7 +311,7 @@ Proxy-based metadata collection, including catalog mode, reports each attempt to
 background statistics writer. Use the current
 [`db/proxy/schema.sql`](db/proxy/schema.sql) for a fresh database, or apply the
 missing [proxy migrations](db/README.md#proxy-schema-migrations) through
-[`008_proxy_website_columns.sql`](db/proxy/migrations/008_proxy_website_columns.sql)
+[`009_shared_proxy_protocol.sql`](db/proxy/migrations/009_shared_proxy_protocol.sql)
 before starting collectors or importing tester results.
 Statistics failures never pause or throttle collection, and shutdown never waits
 for a statistics flush. Unwritten statistics may be lost. The existing behavior
@@ -334,10 +335,14 @@ The database keeps one `proxy_stats` row per proxy. Shared fields count actual
 connection attempts and successful connections across websites.
 `last_connection_attempt_at` records the latest actual attempt, including a
 request that reuses an open connection. `last_connected_at` preserves the latest
-confirmed connection time, and `last_connection_error` records the latest actual
-attempt's network failure as a short `stage:code` label. A later attempt with no
-network error clears it. A check rejected before a network attempt leaves these
-shared fields unchanged.
+confirmed connection time. `working_protocol` holds a proxy transport confirmed
+by a verified website response and survives later failed checks.
+`last_connection_error` records the latest actual attempt's proxy endpoint, TLS,
+authentication or explicit protocol failure as a short `stage:code` label.
+Target-tunnel refusals, website TLS failures and response-body errors stay in
+`youtube_last_error`. A later attempt with no proxy-specific error clears the
+shared error. A check rejected before a network attempt leaves these shared
+fields unchanged.
 
 YouTube results, errors, request/response/data counters, score inputs and import
 markers live in the separate `youtube_*` columns of that same row. The view's
@@ -408,15 +413,18 @@ Optional environment variables:
 
 ## Check the worker
 
-The Python proxy tests still contain field names and aggregate attributes from
-before migration 008. Those fixtures need updating before the full suite can
-validate the current proxy schema. Python code changed for migration 008 passed
-syntax checks; runtime tests and a full data comparison were not run for that change.
-
 The full Python suite is invoked with:
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
+```
+
+The proxy tests cover transport identity, migration preservation, shared protocol
+selection, website error separation and statistics replay. To include their
+database checks in isolated schemas with rollback:
+
+```sh
+PROXY_TEST_DATABASE=1 .venv/bin/python -m unittest discover -s tests -p '*prox*.py'
 ```
 
 To include database insertion tests, supply a test connection. These tests use

@@ -32,12 +32,13 @@ class ConnectionJournalTests(unittest.TestCase):
         self.assertEqual(importer.connection_observation(result),(True,'connect:timeout'))
 
     def test_http_response_and_body_format_errors_are_not_connection_errors(self):
-        for body_error,expected in ((None,None),('gzip_decode_error',None),
-                                    ('body_too_large',None),('timeout','youtube_body:timeout')):
+        for body_error in (None,'gzip_decode_error','body_too_large','timeout'):
             result={'attempted':True,'responds':True,'attempts':[
                 {'status':'responds','connected':True,'request_sent':True,
                  'http_status':403,'body_error':body_error}]}
-            self.assertEqual(importer.connection_observation(result),(True,expected))
+            self.assertEqual(importer.connection_observation(result),(True,None))
+            self.assertEqual(importer.website_error(result,None),
+                             'youtube_body:'+body_error if body_error else 'http:http_403')
 
     def test_unknown_observation_and_invalid_connection_flags(self):
         result={'attempted':True,'responds':False,'attempts':[{}]}
@@ -76,8 +77,8 @@ class CompactionTests(unittest.TestCase):
                 VALUES (%s,'8.8.8.8',8080,'unknown','2026-01-01Z','2026-01-02Z') RETURNING proxy_id""",
                 (b'x'*32,)).fetchone()[0]
         return self.conn.execute("""INSERT INTO proxies
-            (connection_key,address,port,protocol,last_seen_at)
-            VALUES (%s,'8.8.8.8',8080,'unknown','2026-01-02Z') RETURNING proxy_id""",
+            (connection_key,address,port,last_seen_at)
+            VALUES (%s,'8.8.8.8',8080,'2026-01-02Z') RETURNING proxy_id""",
             (b'x'*32,)).fetchone()[0]
 
     def journal(self, folder, proxy_id, day=3, responds=True, bad_summary=False, bad_key=False):
@@ -103,8 +104,8 @@ class CompactionTests(unittest.TestCase):
             self.assertEqual(importer.import_journal(self.conn,first,1)['new_results'],0)
             second = self.journal(folder,proxy_id,day=4,responds=False)
             self.assertEqual(importer.import_journal(self.conn,second,1)['new_results'],1)
-            row = self.conn.execute('SELECT connection_attempts,youtube_requests_sent,youtube_responses_received,status,working_protocol FROM proxy_stats').fetchone()
-            self.assertEqual(row,(2,2,1,'not_responding','socks5'))
+            row = self.conn.execute('SELECT connection_attempts,youtube_requests_sent,youtube_responses_received,youtube_responded,working_protocol FROM proxy_health').fetchone()
+            self.assertEqual(row,(2,2,1,False,'socks5'))
             with self.assertRaisesRegex(ValueError,'older or changed'):
                 importer.import_journal(self.conn,first,1)
             self.assertEqual(self.conn.execute('SELECT connection_attempts FROM proxy_stats').fetchone()[0],2)
@@ -122,22 +123,27 @@ class CompactionTests(unittest.TestCase):
             for path in (first,second):
                 importer.import_journal(self.conn,path,1)
             self.conn.execute('UPDATE proxy_stats SET successful_connections=0,last_connected_at=NULL,last_connection_error=NULL')
-            before=self.conn.execute('SELECT * FROM proxy_stats').fetchone()[:15]
+            columns=[row[0] for row in self.conn.execute('''SELECT column_name FROM information_schema.columns
+                WHERE table_schema=%s AND table_name='proxy_stats' AND column_name NOT IN
+                ('successful_connections','last_connected_at','last_connection_error') ORDER BY ordinal_position''',(self.schema,))]
+            preserved='SELECT '+','.join(columns)+' FROM proxy_stats'
+            before=self.conn.execute(preserved).fetchone()
             reports=backfill.stage_history(self.conn,[first,second,first],1)
             self.assertEqual(len(reports),2)
             self.assertEqual(backfill.history_summary(self.conn)['successful_connections'],2)
             self.assertEqual(backfill.apply_backfill(self.conn)['updated_proxies'],1)
-            self.assertEqual(self.conn.execute('SELECT * FROM proxy_stats').fetchone()[:15],before)
-            self.assertEqual(self.conn.execute('SELECT successful_connections,last_connected_at=checked_at,last_connection_error FROM proxy_stats').fetchone(),(2,True,'connect:timeout'))
+            self.assertEqual(self.conn.execute(preserved).fetchone(),before)
+            self.assertEqual(self.conn.execute('SELECT successful_connections,last_connected_at=last_connection_attempt_at,last_connection_error FROM proxy_stats').fetchone(),(2,True,'connect:timeout'))
             self.assertEqual(backfill.apply_backfill(self.conn)['updated_proxies'],0)
             # A newer scored data response proves one further connection.
-            self.conn.execute("""UPDATE proxy_stats SET checked_at='2026-01-05Z',last_response_at='2026-01-05Z',
+            self.conn.execute("""UPDATE proxy_stats SET youtube_last_checked_at='2026-01-05Z',youtube_last_response_at='2026-01-05Z',
+                youtube_last_attempt_at='2026-01-05Z',last_connection_attempt_at='2026-01-05Z',
                 last_connected_at='2026-01-05Z',last_connection_error=NULL,
                 connection_attempts=connection_attempts+1,successful_connections=successful_connections+1,
                 youtube_requests_sent=youtube_requests_sent+1,youtube_responses_received=youtube_responses_received+1,
-                youtube_successful_data_received=1,weighted_connection_attempts=1,
-                weighted_youtube_successful_data_received=1,last_scored_attempt_at='2026-01-05Z',
-                status='responds',last_http_status=200""")
+                youtube_successful_data_received=1,youtube_weighted_attempts=1,
+                youtube_weighted_successful_data_received=1,youtube_last_scored_attempt_at='2026-01-05Z',
+                youtube_last_http_status=200""")
             before=self.conn.execute('SELECT * FROM proxy_stats').fetchone()
             self.assertEqual(backfill.apply_backfill(self.conn)['updated_proxies'],0)
             self.assertEqual(self.conn.execute('SELECT * FROM proxy_stats').fetchone(),before)
@@ -273,8 +279,8 @@ class CompactionTests(unittest.TestCase):
             self.assertEqual(importer.import_journal(self.conn,path,1)['new_results'],1)
             self.assertEqual(self.conn.execute('SELECT connection_attempts,youtube_requests_sent,youtube_responses_received,working_protocol FROM proxy_stats').fetchone(),
                              (1,1,1,'socks5'))
-            self.assertEqual(self.conn.execute('SELECT attempted,youtube_responds,detected_protocol FROM proxy_health').fetchone(),
-                             (False,False,None))
+            self.assertEqual(self.conn.execute('SELECT youtube_last_attempt_at<youtube_last_checked_at,youtube_responded,working_protocol FROM proxy_health').fetchone(),
+                             (True,True,'socks5'))
             self.assertEqual(importer.import_journal(self.conn,path,1)['new_results'],0)
 
     def test_column_migration_rejects_inconsistent_previous_status(self):

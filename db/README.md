@@ -53,29 +53,42 @@ The backup and verification report are retained under
 
 ## Compact proxy database
 
-The proxy database has three tables and 35 stored columns. Each proxy has at most
+The proxy database has three tables and 34 stored columns. Each proxy has at most
 one `proxy_stats` row, created when a check or collection outcome is recorded.
 Connection fields are shared; each supported website has a fixed group of columns
 in that same row. The installed website group is YouTube.
 
 | Table | Columns | Contents |
 | --- | ---: | --- |
-| `proxies` | 7 | Connection identity, address, port, declared protocol, settings and last discovery |
+| `proxies` | 6 | Connection identity, address, port, transport configuration and last discovery |
 | `proxy_stats` | 20 | Shared connection observations and separate YouTube results, counters, score inputs and import marker |
 | `proxy_lists` | 8 | Source URLs, protocol hints, enable setting and current collection state |
 
 `proxy_catalog`, `proxy_health`, and `proxy_list_catalog` are views for Postico.
 `media_viewer` has read access. The catalog view excludes connection settings,
-which can contain credentials. It includes `last_connection_attempt_at`.
+which can contain credentials. It includes shared `working_protocol` and
+`last_connection_attempt_at`.
 `proxy_health` shows proxies with a statistics row and derives `youtube_responded`,
 `youtube_score`, and `youtube_score_age_seconds`. These values are not stored again
 in the table. Use `proxy_catalog` to include proxies with no recorded statistics.
 
-Connection identity includes normalized address, port, declared protocol and
-required settings. Display labels are excluded. Settings containing binary nulls
-are stored as a JSON string containing escaped JSON text; decode that string as
-JSON. Other settings are JSON objects. Source protocol hints are claims;
-`proxy_stats.youtube_working_protocol` comes from the last verified YouTube response.
+Connection identity includes normalized address, port, configured transport and
+its original options. Display labels are excluded. `connection_settings` keeps
+the transport type with the options needed to open the connection:
+
+```json
+{"transport": "http", "options": {}}
+```
+
+`transport` is required to try an unverified configuration, including protocols
+such as VLESS and VMess. Options containing binary nulls are stored as escaped
+JSON text inside `options`; decode that string as JSON. Ordinary options are
+objects. The helpers in `proxy_formats.py` handle both forms.
+
+There is no separate `proxies.protocol` column. Confirmed results use shared
+`proxy_stats.working_protocol`. Confirming a protocol leaves the saved transport
+configuration and identity hash unchanged, so rediscovery and old journals still
+match the same proxy.
 
 The BIGINT counters are `connection_attempts`, `successful_connections`, `youtube_requests_sent`,
 `youtube_responses_received`, and `youtube_successful_data_received`. An attempt
@@ -87,7 +100,7 @@ the metadata. The scorer does not inspect video IDs or metadata fields.
 
 ### Shared connection fields
 
-These six columns belong to the proxy across all websites:
+These seven columns belong to the proxy across all websites:
 
 | Field | Meaning |
 | --- | --- |
@@ -96,24 +109,30 @@ These six columns belong to the proxy across all websites:
 | `successful_connections` | Attempts with a confirmed proxy connection, counted once per check or collection request. Reusing an open connection also counts. |
 | `last_connection_attempt_at` | Completion time of the latest actual attempt. NULL before any recorded attempt. |
 | `last_connected_at` | Observation time of the latest confirmed connection. A later failed check does not clear it. |
-| `last_connection_error` | Network failure from the latest actual attempt, such as `connect:timeout` or `proxy_handshake:proxy_http_407`. NULL when that attempt had no recorded network error. |
+| `last_connection_error` | Proxy endpoint, TLS, authentication or explicit protocol failure from the latest actual attempt. NULL when that attempt had no recorded proxy-specific error. |
+| `working_protocol` | Proxy transport confirmed by a verified website response. Any website writer can supply it; failed attempts preserve it. NULL before confirmation. |
 
 A check rejected before a network attempt does not change the shared fields.
 A proxy can accept a connection and still fail during its handshake or while
-reaching the website. YouTube HTTP errors, bot challenges and missing metadata
-do not set `last_connection_error`. Old missing telemetry remains unknown.
+reaching the website. Target-tunnel refusals, ambiguous adapter errors, website
+TLS failures, response-body errors, HTTP errors and missing data stay in the
+website's error field. Old missing telemetry remains unknown.
 Timestamps describe observations, not exact TCP handshake times.
+
+For example, `connect:timeout` and `proxy_handshake:proxy_http_407` can set the
+shared error. `proxy_handshake:proxy_http_403`, `youtube_https:timeout` and
+`youtube_body:timeout` set the YouTube error. The website error also includes
+proxy failures that prevented its request, so it describes that check's outcome.
 
 ### YouTube columns
 
-The other 14 columns keep YouTube results and import order independent of future
+The other 13 columns keep YouTube results and import order independent of future
 website groups:
 
 | Field | Meaning |
 | --- | --- |
 | `youtube_last_checked_at` | Latest check, including configuration or protocol rejection before a network attempt. |
 | `youtube_last_attempt_at` | Completion time of the latest actual YouTube attempt; unchanged by checks rejected before an attempt. |
-| `youtube_working_protocol` | Protocol from the most recent verified YouTube response; retained after later failures. |
 | `youtube_last_http_status` | HTTP status from the latest actual attempt, or NULL if it received no response. |
 | `youtube_last_check_duration_ms` | Duration of the latest check, including checks rejected before an attempt. |
 | `youtube_last_response_at` | Time of the latest verified YouTube HTTP response; retained after later failures. |
@@ -162,7 +181,7 @@ independent producers for the same website can produce stale batches.
 
 Fresh databases use `db/proxy/schema.sql`. Existing 10-table catalogs first apply
 migration 004, which deletes historical tables after retaining current values.
-Existing 34-column catalogs apply migration 005, which rebuilds the three tables
+Catalogs at migration 004 apply migration 005, which rebuilds the three tables
 with 26 columns. Migration 005 removes first-discovery time, first-response time,
 separate last-attempt time, the total including checks rejected before an attempt,
 redundant flags/protocol and the stored URL format hint. It preserves identities,
@@ -191,6 +210,10 @@ Apply each missing migration once:
 /opt/homebrew/opt/postgresql@18/bin/psql -X \
   -h "$PWD/.local/postgres/socket" -U mahmud -d proxy -v ON_ERROR_STOP=1 \
   -f db/proxy/migrations/008_proxy_website_columns.sql
+# Share confirmed protocol and remove the separate input-protocol column:
+/opt/homebrew/opt/postgresql@18/bin/psql -X \
+  -h "$PWD/.local/postgres/socket" -U mahmud -d proxy -v ON_ERROR_STOP=1 \
+  -f db/proxy/migrations/009_shared_proxy_protocol.sql
 ```
 
 Migration 005 locks the three tables and compares every retained value before
@@ -206,18 +229,28 @@ attempt timestamps and `youtube_last_error`, and removes the stored proxy
 `status`. It rebuilds `proxy_catalog` and `proxy_health` with the current fields
 and preserves existing counters and scoring inputs. Old view columns `attempted`,
 `youtube_responds`, `detected_protocol`, `availability` and `score` are removed;
-use the timestamps, `youtube_responded`, `youtube_working_protocol` and
+use the timestamps, `youtube_responded`, shared `working_protocol` and
 `youtube_score` as appropriate. A previous rejection with recorded earlier
 attempts stops the migration: recover its attempt times from retained journals
 before migrating. The migration restores view access for the existing
 `media_viewer` role, which must exist when running these local migrations.
 
+Migration 009 moves the input transport into `connection_settings.transport`
+and nests the original options under `connection_settings.options`, then drops
+`proxies.protocol`. It renames `youtube_working_protocol` to shared
+`working_protocol`. Proxy IDs, identity hashes, counters, scoring inputs and
+the identity sequence remain unchanged. Target and ambiguous failures are
+cleared from `last_connection_error`, with the website error retained or filled
+when it describes the same latest check. The catalog and health views expose
+only the shared confirmed protocol.
+
 Back up the database and stop collectors/importers before upgrading so every
 writer starts with matching code and schema. The SQL files manage their own
 transactions. Run each file once, after checking which migrations the installed
 schema still needs.
-All statistics writers and migrations coordinate through the same advisory lock;
-collection never waits for the statistics writer.
+All statistics writers and migrations coordinate through the same advisory lock.
+Migration 009 also takes the source collector's lock before changing connection
+storage. Metadata collection never waits for the statistics writer.
 
 The local migration 008 committed on October 1, 2026. Its full database backup is
 `.local/proxy-website-columns-20261001/proxy-before-008.dump`; the commit receipt
@@ -225,11 +258,16 @@ is `migration.json` in that directory. Python syntax and installed column names
 were checked. Runtime tests and a full comparison of data before and after the
 migration were not performed. These local artifacts are excluded from Git.
 
+Migration 009's backup and receipt are under
+`.local/proxy-shared-protocol-20261001/`. The backup is `proxy-before-009.dump`.
+The proxy regression suite covers the new layout, preservation of binary options,
+identity matching and separation of proxy errors from website errors.
+
 ### Historical connection backfill
 
 An older catalog whose connection observations have not been initialized can use
 retained finished journals. The current helper targets the schema through
-migration 008. The October 1 local backfill was already applied before migration
+migration 009. The October 1 local backfill was already applied before migration
 008; it does not need to be repeated.
 
 For that retained journal set, the original command was:
@@ -375,9 +413,7 @@ Import rounds in chronological order; do not append to an already imported
 journal or replay old rounds after importing newer ones for the same proxies.
 
 See [the tester guide](../proxy-tester/README.md) for the request, server operation,
-imports, verification and queries. The proxy Python fixtures still need updates
-for migration 008's column names and generic aggregate attributes. After those
-fixtures are updated, parser and database integration checks can be run with:
+imports, verification and queries. Parser and database integration checks:
 
 ```sh
 PROXY_TEST_DATABASE=1 .venv/bin/python -m unittest discover -s tests -p '*prox*.py' -v

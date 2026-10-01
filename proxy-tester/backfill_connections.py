@@ -80,7 +80,7 @@ def stage_history(conn, journals, batch_size=10000):
 def validate_history(conn):
     row = conn.execute('''SELECT
         count(*) FILTER(WHERE p.proxy_id IS NULL OR p.connection_key<>b.connection_key
-            OR p.protocol<>b.declared_protocol),
+            OR p.connection_settings->>'transport' IS DISTINCT FROM b.declared_protocol),
         count(*) FILTER(WHERE s.proxy_id IS NULL OR s.youtube_last_checked_at<b.checked_at
             OR s.connection_attempts<b.connection_attempts OR s.youtube_requests_sent<b.requests_sent),
         count(*) FILTER(WHERE b.successful_connections<0 OR b.successful_connections>b.connection_attempts

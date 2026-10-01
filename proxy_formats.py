@@ -111,6 +111,31 @@ def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
 
 
+def pack_connection_settings(protocol, settings):
+    """Keep the transport and its options together without changing proxy identity."""
+    if not isinstance(protocol, str) or not protocol or not isinstance(settings, dict):
+        raise ValueError('Invalid proxy transport configuration')
+    encoded = canonical_json(settings)
+    # JSONB cannot contain U+0000, including in an object key. Preserve those
+    # options as escaped JSON text inside the otherwise ordinary envelope.
+    return {'transport': protocol, 'options': encoded if '\\u0000' in encoded else settings}
+
+
+def unpack_connection_settings(configuration):
+    """Recover exactly the transport/options used to calculate connection_key."""
+    if not isinstance(configuration, dict):
+        raise ValueError('Invalid proxy transport configuration')
+    protocol, settings = configuration.get('transport'), configuration.get('options')
+    if isinstance(settings, str):
+        try:
+            settings = json.loads(settings)
+        except (ValueError, TypeError):
+            raise ValueError('Invalid proxy connection options') from None
+    if not isinstance(protocol, str) or not protocol or not isinstance(settings, dict):
+        raise ValueError('Invalid proxy transport configuration')
+    return protocol, settings
+
+
 @dataclass(repr=False)
 class Proxy:
     address: str

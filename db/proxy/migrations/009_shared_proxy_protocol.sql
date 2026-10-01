@@ -1,118 +1,58 @@
-CREATE TABLE public.proxies (
-    proxy_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    connection_key BYTEA NOT NULL UNIQUE CHECK (octet_length(connection_key) = 32),
-    address TEXT NOT NULL CHECK (length(address) BETWEEN 1 AND 253),
-    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
-    connection_settings JSONB NOT NULL DEFAULT '{"transport":"unknown","options":{}}'::jsonb,
-    CONSTRAINT proxies_connection_settings_check CHECK
+-- Share the confirmed proxy protocol and keep transport configuration together.
+BEGIN;
+SET LOCAL lock_timeout = '15s';
+SELECT pg_advisory_xact_lock(6389247650123);
+SELECT pg_advisory_xact_lock(hashtextextended('proxy:proxy_collection',0));
+LOCK TABLE public.proxies,public.proxy_stats IN ACCESS EXCLUSIVE MODE;
+
+DROP VIEW public.proxy_catalog;
+DROP VIEW public.proxy_health;
+
+-- Nest the original settings verbatim. A string here is escaped JSON used for
+-- binary nulls; it must not be cast to JSONB. IDs and identity hashes stay intact.
+UPDATE public.proxies SET connection_settings =
+    jsonb_build_object('transport',protocol,'options',connection_settings);
+ALTER TABLE public.proxies
+    DROP COLUMN protocol,
+    ALTER COLUMN connection_settings SET DEFAULT '{"transport":"unknown","options":{}}'::jsonb,
+    ADD CONSTRAINT proxies_connection_settings_check CHECK
         (jsonb_typeof(connection_settings) = 'object'
          AND connection_settings ?& ARRAY['transport','options']
          AND jsonb_typeof(connection_settings->'transport') = 'string'
          AND length(connection_settings->>'transport') > 0
-         AND jsonb_typeof(connection_settings->'options') IN ('object','string')),
-    last_seen_at TIMESTAMPTZ NOT NULL
-);
+         AND jsonb_typeof(connection_settings->'options') IN ('object','string'));
 
-CREATE TABLE public.proxy_stats (
-    proxy_id BIGINT PRIMARY KEY REFERENCES public.proxies(proxy_id),
-    connection_attempts BIGINT NOT NULL DEFAULT 0,
-    successful_connections BIGINT NOT NULL DEFAULT 0,
-    last_connection_attempt_at TIMESTAMPTZ,
-    last_connected_at TIMESTAMPTZ,
-    last_connection_error TEXT,
-    working_protocol TEXT,
-    youtube_last_checked_at TIMESTAMPTZ,
-    youtube_last_attempt_at TIMESTAMPTZ,
-    youtube_last_http_status SMALLINT,
-    youtube_last_check_duration_ms DOUBLE PRECISION,
-    youtube_last_response_at TIMESTAMPTZ,
-    youtube_last_error TEXT,
-    youtube_requests_sent BIGINT NOT NULL DEFAULT 0,
-    youtube_responses_received BIGINT NOT NULL DEFAULT 0,
-    youtube_successful_data_received BIGINT NOT NULL DEFAULT 0,
-    youtube_weighted_attempts DOUBLE PRECISION NOT NULL DEFAULT 0,
-    youtube_weighted_successful_data_received DOUBLE PRECISION NOT NULL DEFAULT 0,
-    youtube_last_scored_attempt_at TIMESTAMPTZ,
-    youtube_last_import_key BYTEA,
-    CONSTRAINT proxy_stats_attempt_count_check CHECK (connection_attempts >= 0),
-    CONSTRAINT proxy_stats_connection_count_check CHECK
-        (successful_connections BETWEEN 0 AND connection_attempts),
-    CONSTRAINT proxy_stats_attempt_at_check CHECK
-        ((connection_attempts > 0) = (last_connection_attempt_at IS NOT NULL)),
-    CONSTRAINT proxy_stats_connected_at_check CHECK
-        (last_connected_at IS NULL OR (successful_connections > 0 AND last_connected_at <= last_connection_attempt_at)),
-    CONSTRAINT proxy_stats_connection_error_check CHECK
+ALTER TABLE public.proxy_stats RENAME COLUMN youtube_working_protocol TO working_protocol;
+ALTER TABLE public.proxy_stats
+    DROP CONSTRAINT proxy_stats_connection_error_check,
+    DROP CONSTRAINT proxy_stats_youtube_response_at_check;
+
+-- Existing website errors already contain these labels. Fill a missing current
+-- website error before clearing target/ambiguous failures from the shared field.
+UPDATE public.proxy_stats SET
+    youtube_last_error=coalesce(youtube_last_error,
+        CASE WHEN youtube_last_checked_at=last_connection_attempt_at THEN last_connection_error END),
+    last_connection_error=NULL
+WHERE last_connection_error IS NOT NULL AND last_connection_error !~
+    '^((resolve|connect|proxy_tls):[a-z][a-z0-9_]*|proxy_handshake:(proxy_authentication_required|proxy_authentication_failed|proxy_http_407|not_socks5|invalid_socks5_address|socks4_reply_92|socks4_reply_93|socks5_reply_7|socks5_reply_8))$';
+
+ALTER TABLE public.proxy_stats
+    ADD CONSTRAINT proxy_stats_connection_error_check CHECK
         (last_connection_error IS NULL OR last_connection_error ~
          '^((resolve|connect|proxy_tls):[a-z][a-z0-9_]*|proxy_handshake:(proxy_authentication_required|proxy_authentication_failed|proxy_http_407|not_socks5|invalid_socks5_address|socks4_reply_92|socks4_reply_93|socks5_reply_7|socks5_reply_8))$'),
-    CONSTRAINT proxy_stats_working_protocol_check CHECK
+    ADD CONSTRAINT proxy_stats_working_protocol_check CHECK
         (working_protocol IS NULL OR length(working_protocol) > 0),
-    CONSTRAINT proxy_stats_youtube_requests_check CHECK
-        (youtube_requests_sent BETWEEN 0 AND connection_attempts),
-    CONSTRAINT proxy_stats_youtube_responses_check CHECK
-        (youtube_responses_received BETWEEN 0 AND youtube_requests_sent),
-    CONSTRAINT proxy_stats_youtube_data_check CHECK
-        (youtube_successful_data_received BETWEEN 0 AND youtube_responses_received),
-    CONSTRAINT proxy_stats_youtube_http_check CHECK
-        (youtube_last_http_status IS NULL OR (youtube_last_http_status BETWEEN 100 AND 599
-         AND youtube_last_attempt_at IS NOT NULL)),
-    CONSTRAINT proxy_stats_youtube_duration_check CHECK (youtube_last_check_duration_ms >= 0),
-    CONSTRAINT proxy_stats_youtube_error_check CHECK
-        (youtube_last_error IS NULL OR youtube_last_error ~ '^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$'),
-    CONSTRAINT proxy_stats_youtube_attempt_at_check CHECK
-        (youtube_last_attempt_at IS NULL OR (youtube_last_checked_at IS NOT NULL
-         AND youtube_last_attempt_at <= youtube_last_checked_at
-         AND last_connection_attempt_at IS NOT NULL AND youtube_last_attempt_at <= last_connection_attempt_at)),
-    CONSTRAINT proxy_stats_youtube_response_at_check CHECK
+    ADD CONSTRAINT proxy_stats_youtube_response_at_check CHECK
         ((youtube_responses_received > 0) = (youtube_last_response_at IS NOT NULL)
          AND (youtube_responses_received = 0 OR working_protocol IS NOT NULL)
          AND (youtube_last_response_at IS NULL OR (youtube_last_attempt_at IS NOT NULL
               AND youtube_last_response_at <= youtube_last_attempt_at))
          AND (youtube_last_http_status IS NULL OR (youtube_last_response_at IS NOT NULL
-              AND youtube_last_response_at = youtube_last_attempt_at))),
-    CONSTRAINT proxy_stats_youtube_weight_check CHECK
-        (youtube_weighted_attempts >= 0 AND youtube_weighted_attempts < 'Infinity'::double precision
-         AND youtube_weighted_successful_data_received BETWEEN 0 AND youtube_weighted_attempts),
-    CONSTRAINT proxy_stats_youtube_scored_at_check CHECK
-        ((youtube_last_scored_attempt_at IS NULL AND youtube_weighted_attempts = 0
-          AND youtube_successful_data_received = 0)
-         OR (youtube_last_scored_attempt_at IS NOT NULL AND youtube_last_attempt_at IS NOT NULL
-             AND youtube_last_scored_attempt_at <= youtube_last_attempt_at AND youtube_weighted_attempts >= 1)),
-    CONSTRAINT proxy_stats_youtube_import_check CHECK
-        ((youtube_last_checked_at IS NULL) = (youtube_last_import_key IS NULL)
-         AND (youtube_last_import_key IS NULL OR octet_length(youtube_last_import_key) = 32))
-);
-CREATE INDEX proxy_stats_youtube_responds_idx ON public.proxy_stats(proxy_id)
-    WHERE youtube_last_http_status IS NOT NULL;
-
-CREATE TABLE public.proxy_lists (
-    url TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    protocol_hints TEXT[] NOT NULL DEFAULT '{}',
-    enabled BOOLEAN NOT NULL DEFAULT false,
-    run_id UUID,
-    status TEXT NOT NULL DEFAULT 'not_checked',
-    fetched_at TIMESTAMPTZ,
-    fetch_state JSONB NOT NULL DEFAULT '{}'::jsonb
-);
+              AND youtube_last_response_at = youtube_last_attempt_at)));
 
 CREATE VIEW public.proxy_catalog AS
 SELECT p.proxy_id, p.address, p.port, s.working_protocol, p.last_seen_at, s.last_connection_attempt_at
 FROM public.proxies p LEFT JOIN public.proxy_stats s USING (proxy_id);
-
--- Both scoring updates and reads use this one-hour half-life. The logarithmic
--- form avoids floating-point underflow when evidence is extremely old.
-CREATE FUNCTION public.proxy_decayed_weight(weight DOUBLE PRECISION,
-    measured_at TIMESTAMPTZ, at_time TIMESTAMPTZ)
-RETURNS DOUBLE PRECISION LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT CASE WHEN weight = 0 THEN 0
-                WHEN at_time <= measured_at THEN weight
-                WHEN log_weight < -700 THEN 0
-                ELSE exp(log_weight) END
-    FROM (SELECT ln(NULLIF(weight,0))
-          - ln(2.0::double precision)
-            * greatest(0, extract(epoch FROM (at_time-measured_at))::double precision) / 3600.0
-          AS log_weight) AS evidence
-$$;
 
 CREATE VIEW public.proxy_health AS
 SELECT p.proxy_id, p.address, p.port,
@@ -139,12 +79,7 @@ CROSS JOIN LATERAL (
                s.youtube_last_scored_attempt_at,statement_timestamp()) AS successes
 ) AS recent;
 
-CREATE VIEW public.proxy_list_catalog AS
-SELECT url, kind, protocol_hints, enabled, run_id, status, fetched_at,
-       (fetch_state->>'http_status')::smallint AS http_status,
-       (fetch_state->>'unique_entries')::bigint AS unique_entries,
-       fetch_state->>'error_type' AS error_type
-FROM public.proxy_lists;
+GRANT SELECT ON public.proxy_catalog,public.proxy_health TO media_viewer;
 
 COMMENT ON TABLE public.proxies IS
     'Published proxy configurations. Identity includes address, port and transport configuration. See proxy_health for observed results.';
@@ -196,3 +131,5 @@ COMMENT ON TABLE public.proxy_lists IS
     'Source URLs and only their current collection state. Starting a new collection replaces the previous run selection and state for enabled URLs. Format hints are derived from URLs by the collector.';
 COMMENT ON COLUMN public.proxy_lists.fetch_state IS
     'Latest download/parser state, including payload checksum and cache path needed for reparsing and pagination. Replaced on each completed download.';
+
+COMMIT;

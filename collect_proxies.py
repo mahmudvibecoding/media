@@ -25,7 +25,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from proxy_formats import PARSER_VERSION, Proxy, canonical_json, parse_proxies
+from proxy_formats import PARSER_VERSION, Proxy, canonical_json, pack_connection_settings, parse_proxies
 from proxy_pagination import next_page
 
 ROOT = Path(__file__).resolve().parent
@@ -47,12 +47,8 @@ def output(value):
     print(json.dumps(value, default=str, ensure_ascii=False), flush=True)
 
 
-def stored_settings(settings):
-    # JSONB cannot contain U+0000. A JSON string containing the escaped JSON text
-    # preserves binary obfuscation settings losslessly. Ordinary settings remain
-    # JSON objects; callers can json.loads() a string value when reading it back.
-    encoded = canonical_json(settings)
-    return Jsonb(encoded if '\\u0000' in encoded else settings)
+def stored_settings(settings, protocol):
+    return Jsonb(pack_connection_settings(protocol, settings))
 
 
 def connection():
@@ -97,7 +93,7 @@ class Store:
         self.writer.execute("SET lock_timeout = '30s'")
         self.writer.execute('''CREATE TEMP TABLE proxy_stage (
             connection_key BYTEA PRIMARY KEY, address TEXT, port INTEGER,
-            protocol TEXT, connection_settings JSONB
+            connection_settings JSONB
         ) ON COMMIT DELETE ROWS''')
         self.run_id = None
 
@@ -202,16 +198,17 @@ class Store:
                         unchanged_entries = old_cache.exists() and same_parsed_entries(old_cache, cache)
             if cache and result['unique_entries'] and not unchanged_entries:
                 with self.writer.cursor().copy('''COPY proxy_stage
-                    (connection_key,address,port,protocol,connection_settings) FROM STDIN''') as cp:
+                    (connection_key,address,port,connection_settings) FROM STDIN''') as cp:
                     with gzip.open(cache, 'rt', encoding='utf-8') as f:
                         next(f)
                         for line in f:
                             row = json.loads(line)
                             proxy = Proxy(row['address'], row['port'], row['protocol'], row['settings'])
-                            cp.write_row((proxy.key, proxy.address, proxy.port, proxy.protocol, stored_settings(proxy.settings)))
+                            cp.write_row((proxy.key, proxy.address, proxy.port,
+                                          stored_settings(proxy.settings, proxy.protocol)))
                 self.writer.execute('''INSERT INTO proxies
-                    (connection_key,address,port,protocol,connection_settings,last_seen_at)
-                    SELECT connection_key,address,port,protocol,connection_settings,%s FROM proxy_stage
+                    (connection_key,address,port,connection_settings,last_seen_at)
+                    SELECT connection_key,address,port,connection_settings,%s FROM proxy_stage
                     ON CONFLICT (connection_key) DO UPDATE SET
                         last_seen_at=GREATEST(proxies.last_seen_at,excluded.last_seen_at)
                     WHERE excluded.last_seen_at > proxies.last_seen_at''', (observed,))
@@ -249,7 +246,8 @@ class Store:
             (SELECT count(*) FROM proxy_stats WHERE connection_attempts > 0) AS individually_tested
             FROM proxies""").fetchone()
         summary['protocol_counts'] = {r['protocol']: r['n'] for r in self.control.execute(
-            'SELECT protocol,count(*) AS n FROM proxies GROUP BY protocol ORDER BY count(*) DESC').fetchall()}
+            "SELECT connection_settings->>'transport' AS protocol,count(*) AS n "
+            "FROM proxies GROUP BY connection_settings->>'transport' ORDER BY count(*) DESC").fetchall()}
         path = STORAGE / 'runs' / str(self.run_id) / 'summary.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(summary, default=int, indent=2) + '\n')
