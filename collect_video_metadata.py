@@ -306,7 +306,7 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
                     result["error"] = "YouTube requires sign-in for bot verification"
         except (ResponseShapeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             result.update(status="unexpected_response", error=str(exc))
-        except (httpx.HTTPError, TimeoutError) as exc:
+        except (httpx.HTTPError, TimeoutError, ssl.SSLError) as exc:
             excluded = (local_worker_error(exc) or (trace is not None and trace.local_failure)
                         or (bridge is not None and bridge.local_error(exc)))
             if trace is not None:

@@ -16,9 +16,13 @@ import os
 from pathlib import Path
 import random
 import signal
+import socket
+import socketserver
 import sqlite3
+import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -221,18 +225,98 @@ def finish(folder, worker, events):
         conn.commit()
 
 
+def receive_message(stream):
+    header = stream.read(4)
+    if len(header) != 4:
+        raise ConnectionError('Queue message header is incomplete')
+    size = struct.unpack('!I', header)[0]
+    if not 0 < size <= 64 * 1024 * 1024:
+        raise ValueError('Queue message is too large')
+    data = stream.read(size)
+    if len(data) != size:
+        raise ConnectionError('Queue message body is incomplete')
+    return json.loads(data)
+
+
+def send_message(stream, value):
+    data = json.dumps(value, ensure_ascii=False, separators=(',', ':'), default=str).encode()
+    if len(data) > 64 * 1024 * 1024:
+        raise ValueError('Queue message is too large')
+    stream.write(struct.pack('!I', len(data)) + data)
+    stream.flush()
+
+
+def queue_request(folder, action, worker, **values):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(120)
+        connection.connect(str(Path(folder) / 'queue.sock'))
+        with connection.makefile('rwb') as stream:
+            send_message(stream, {'action': action, 'worker': worker, **values})
+            response = receive_message(stream)
+    if not response['ok']:
+        raise RuntimeError('Queue request failed: ' + response['error'])
+    return response['result']
+
+
+def run_broker(folder):
+    """Serialize writes outside fetching processes and acknowledge only commits."""
+    folder = Path(folder)
+    lock = (folder / 'broker.lock').open('w')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    address = folder / 'queue.sock'
+    address.unlink(missing_ok=True)
+    mutation = threading.Lock()
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            self.connection.settimeout(120)
+            try:
+                request = receive_message(self.rfile)
+                with mutation:
+                    if request['action'] == 'claim':
+                        result = claim(folder, request['worker'], request['count'])
+                    elif request['action'] == 'finish':
+                        finish(folder, request['worker'], request['events'])
+                        result = len(request['events'])
+                    else:
+                        raise ValueError('Unknown queue action')
+                send_message(self.wfile, {'ok': True, 'result': result})
+            except Exception as exc:
+                print(json.dumps({'queue_error': type(exc).__name__, 'at': utcnow()}), flush=True)
+                try:
+                    send_message(self.wfile, {'ok': False, 'error': type(exc).__name__})
+                except OSError:
+                    pass
+
+    class Server(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+        request_queue_size = 128
+
+    try:
+        with Server(str(address), Handler) as server:
+            address.chmod(0o600)
+            print(json.dumps({'queue_ready': True}), flush=True)
+            server.serve_forever()
+    finally:
+        address.unlink(missing_ok=True)
+        lock.close()
+
+
 class ProxyPool:
     """One active request per configuration, with fast reuse after data successes."""
     def __init__(self, proxies, usage):
         self.proxies = proxies
         self.untested = deque(i for i, p in enumerate(proxies) if p.proxy_id not in usage)
         self.proven = {i for i, p in enumerate(proxies) if usage.get(p.proxy_id, {}).get('successes', 0)}
-        self.ready = [(0.0 if i in self.proven else time.monotonic() + 60, i)
-                      for i, p in enumerate(proxies) if p.proxy_id in usage]
+        self.good = [(0.0, i) for i in self.proven]
+        self.ready = [(time.monotonic() + 60, i) for i, p in enumerate(proxies)
+                      if p.proxy_id in usage and i not in self.proven]
+        heapq.heapify(self.good)
         heapq.heapify(self.ready)
         self.failures = Counter({i: min(6, usage[p.proxy_id].get('attempts', 0))
                                  for i, p in enumerate(proxies) if p.proxy_id in usage and i not in self.proven})
         self.recovery = False
+        self.selections = 0
         self.changed = asyncio.Event()
 
     async def acquire(self, previous=None):
@@ -244,15 +328,22 @@ class ProxyPool:
                     index = self.untested.popleft()
                 return index
             now = time.monotonic()
-            if self.ready and self.ready[0][0] <= now:
-                _, index = heapq.heappop(self.ready)
-                if self.recovery and self.proven and index not in self.proven:
+            allow_other = not self.recovery or not self.proven
+            good_available = bool(self.good and self.good[0][0] <= now)
+            other_available = bool(allow_other and self.ready and self.ready[0][0] <= now)
+            candidates = ([self.good] if good_available else []) + ([self.ready] if other_available else [])
+            if candidates:
+                # Keep a small exploration share without letting a large failed
+                # catalog crowd out configurations that return metadata.
+                queue = self.ready if other_available and (not good_available or self.selections % 20 == 19) else self.good
+                _, index = heapq.heappop(queue)
+                if self.proxies[index].proxy_id == previous and any(q and q[0][0] <= now for q in candidates):
+                    heapq.heappush(queue, (now + 0.01, index))
                     continue
-                if self.proxies[index].proxy_id == previous and self.ready:
-                    heapq.heappush(self.ready, (now + 0.1, index))
-                    continue
+                self.selections += 1
                 return index
-            wait = max(0.01, min(1.0, self.ready[0][0] - now)) if self.ready else 1.0
+            deadlines = [q[0][0] for q in (self.good, self.ready if allow_other else []) if q]
+            wait = max(0.01, min(1.0, min(deadlines) - now)) if deadlines else 1.0
             self.changed.clear()
             try:
                 await asyncio.wait_for(self.changed.wait(), wait)
@@ -269,7 +360,7 @@ class ProxyPool:
             delay = min(60, 2 ** min(6, self.failures[index]))
             if local_failure:
                 delay = max(60, delay)
-        heapq.heappush(self.ready, (time.monotonic() + delay, index))
+        heapq.heappush(self.good if index in self.proven else self.ready, (time.monotonic() + delay, index))
         self.changed.set()
 
 
@@ -286,7 +377,7 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
         raise ValueError('Worker has no proxy configurations')
     pool = ProxyPool(proxies, usage)
     pending = deque()
-    writes = asyncio.Queue()
+    writes = asyncio.Queue(maxsize=1024)
     fetching = asyncio.Lock()
     active = 0
     stopped = False
@@ -303,7 +394,7 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
                 return
             batch = [first]
             await asyncio.sleep(0.02)
-            while len(batch) < 128:
+            while len(batch) < 512:
                 try:
                     item = writes.get_nowait()
                 except asyncio.QueueEmpty:
@@ -311,7 +402,7 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
                 if item is None:
                     raise RuntimeError('Writer closed before pending results were flushed')
                 batch.append(item)
-            await asyncio.to_thread(finish, folder, worker, batch)
+            await asyncio.to_thread(queue_request, folder, 'finish', worker, events=batch)
             for _ in batch:
                 writes.task_done()
 
@@ -325,8 +416,8 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
             if not pending and time.monotonic() < next_claim_at:
                 return None
             if not pending:
-                rows = await asyncio.to_thread(claim, folder, worker,
-                    max(32, min(512, control['concurrency_per_worker'])))
+                rows = await asyncio.to_thread(queue_request, folder, 'claim', worker,
+                    count=max(32, min(512, control['concurrency_per_worker'])))
                 pending.extend(rows)
                 if not rows:
                     next_claim_at = time.monotonic() + 0.5
@@ -382,7 +473,7 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
             await asyncio.sleep(2)
 
     async with CatalogClients(proxies, 1024, connect_timeout=connect_timeout,
-                              request_timeout=total_timeout, per_proxy_connections=1) as clients:
+                              request_timeout=total_timeout, per_proxy_connections=1, keepalive_expiry=120) as clients:
         writer_task = asyncio.create_task(writer())
         tasks = [asyncio.create_task(task(i, clients)) for i in range(1024)]
         refresh_task = asyncio.create_task(refresh())
@@ -479,8 +570,23 @@ def run_controller(folder):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     previous = None
+    broker_log = (folder / 'queue.log').open('ab', buffering=0)
+    broker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'broker', '--run', str(folder)],
+                              stdout=broker_log, stderr=subprocess.STDOUT)
     try:
+        for _ in range(100):
+            if broker.poll() is not None:
+                raise RuntimeError('Queue broker did not start; inspect queue.log')
+            try:
+                queue_request(folder, 'claim', -1, count=0)
+                break
+            except (ConnectionError, OSError):
+                time.sleep(0.1)
+        else:
+            raise RuntimeError('Queue broker did not become ready')
         while True:
+            if broker.poll() is not None:
+                raise RuntimeError('Queue broker stopped; inspect queue.log')
             if json.loads((folder / 'control.json').read_text()).get('stop'):
                 stop_requested = True
             state = queue_status(folder)
@@ -542,6 +648,13 @@ def run_controller(folder):
         atomic_json(folder / 'status.json', queue_status(folder))
         for log in logs.values():
             log.close()
+        broker.terminate()
+        try:
+            broker.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            broker.kill()
+            broker.wait()
+        broker_log.close()
         lock.close()
 
 
@@ -556,7 +669,7 @@ def main():
     init.add_argument('--workers', type=int, default=8)
     init.add_argument('--concurrency', type=int, default=128)
     init.add_argument('--max-attempts', type=int, default=3)
-    for name in ('run', 'worker', 'status'):
+    for name in ('run', 'worker', 'status', 'broker'):
         command = sub.add_parser(name)
         command.add_argument('--run', type=Path, required=True)
         if name == 'worker':
@@ -570,6 +683,8 @@ def main():
         print(json.dumps(initialize(args.run, args.workers, args.concurrency, args.max_attempts)))
     elif args.command == 'worker':
         asyncio.run(run_worker(args.run, args.worker))
+    elif args.command == 'broker':
+        run_broker(args.run)
     elif args.command == 'run':
         run_controller(args.run)
     else:

@@ -81,10 +81,11 @@ def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connectio
 class CatalogClients:
     """Create each proxy's HTTP client lazily, reusing clients and a shared CA store."""
     def __init__(self, proxies, concurrency, binary=DEFAULT_BRIDGE_BINARY, *,
-                 connect_timeout=10, request_timeout=20, per_proxy_connections=None):
+                 connect_timeout=10, request_timeout=20, per_proxy_connections=None, keepalive_expiry=5):
         self.proxies, self.concurrency, self.binary = proxies, concurrency, Path(binary)
         self.connect_timeout, self.request_timeout = connect_timeout, request_timeout
         self.per_proxy_connections = per_proxy_connections or concurrency
+        self.keepalive_expiry = keepalive_expiry
         self.process = None
         self._directory = None
         self._clients = {}
@@ -134,7 +135,8 @@ class CatalogClients:
                 verify=self._tls, headers={'Content-Type': 'application/json', 'Accept-Encoding': 'gzip'},
                 timeout=httpx.Timeout(self.request_timeout, connect=self.connect_timeout),
                 limits=httpx.Limits(max_connections=self.per_proxy_connections,
-                                   max_keepalive_connections=self.per_proxy_connections))
+                                   max_keepalive_connections=self.per_proxy_connections,
+                                   keepalive_expiry=self.keepalive_expiry))
             client.catalog_bridge = self
             self._clients[index] = client
         return self._clients[index]

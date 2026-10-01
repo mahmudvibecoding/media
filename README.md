@@ -245,6 +245,9 @@ that previously received a YouTube response. Server workers keep a durable SQLit
 queue and write immutable, checksummed result batches. `metadata_bulk_import.py`
 copies those batches back and updates the local `media` and `proxy` databases.
 PostgreSQL stays local; the server does not need database access.
+A dedicated queue process serializes lease and result writes over a private Unix
+socket. Workers wait for a commit acknowledgement and keep at most 1,024 completed
+results in memory while writes catch up.
 
 Export a new snapshot into a new directory:
 
@@ -268,10 +271,13 @@ Initialize and start from the server's checkout:
 
 The concurrency argument is per worker: these defaults allow 1,024 simultaneous
 requests. Each proxy belongs to one worker and has at most one active request.
-Workers first try their unused configurations, then reuse successful ones more
-often. Repeatedly failing configurations become less eligible for fresh work.
+Workers first try their unused configurations, then prefer successful ones.
+When both groups are ready, 95% of selections go to configurations that have
+returned metadata and 5% recheck the others. Repeated failures postpone a
+configuration's next eligibility; successes make it eligible immediately.
 Connection setup has a five-second timeout; the entire request has a twenty-second
-deadline. There are no retries inside an individual request.
+deadline. Idle reusable connections are kept for up to two minutes. There are no
+retries inside an individual request.
 
 Videos without previous errors come first. Failed videos enter a recovery round
 after the initial queue finishes. Recovery uses configurations that returned

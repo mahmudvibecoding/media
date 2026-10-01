@@ -1,13 +1,19 @@
 """Durable leases, verified batches, and recovery across database commits."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import gzip
 import json
 import os
+import ssl
 from pathlib import Path
+import socket
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -16,7 +22,7 @@ import psycopg
 
 from collect_video_metadata import fetch_metadata, metadata_error_reason
 from metadata_bulk import (ProxyPool, atomic_json, claim, connect_queue, digest,
-    export_events, finish, initialize, queue_status, recover_leases)
+    export_events, finish, initialize, queue_request, queue_status, recover_leases, send_message)
 from metadata_bulk_import import apply_chunk, read_chunk, statistics_batch
 from proxy_catalog import CatalogProxy
 from proxy_statistics import AttemptOutcome
@@ -155,6 +161,16 @@ class QueueTests(QueueFixture, unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tls_record_error_is_one_failed_attempt_and_does_not_kill_the_worker(self):
+        def broken(_):
+            raise ssl.SSLError('DECRYPTION_FAILED_OR_BAD_RECORD_MAC')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(broken)) as client:
+            observed = []
+            result = await fetch_metadata(client, VIDEO, retries=0, on_attempt=observed.append)
+        self.assertEqual(result['error'], 'SSLError')
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(observed[0].data_received)
+
     async def test_wall_deadline_interrupts_a_stalled_body_and_records_one_attempt(self):
         class Body(httpx.AsyncByteStream):
             async def __aiter__(self):
@@ -176,6 +192,72 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         pool = ProxyPool(proxies, {1: {'successes': 0}, 2: {'successes': 1}, 3: {'successes': 0}})
         pool.recovery = True
         self.assertEqual(await asyncio.wait_for(pool.acquire(), 1), 1)
+
+    async def test_large_failed_catalog_does_not_crowd_out_proven_configurations(self):
+        proxies = [CatalogProxy(n, b'x' * 32, '8.8.8.8', 8080, 'http', 'http', {}) for n in range(1, 102)]
+        pool = ProxyPool(proxies, {p.proxy_id: {'successes': int(p.proxy_id == 101)} for p in proxies})
+        pool.ready = [(0, i) for i in range(100)]
+        selected = []
+        for _ in range(20):
+            index = await asyncio.wait_for(pool.acquire(), 1)
+            selected.append(index)
+            pool.release(index, index == 100)
+        self.assertGreaterEqual(selected.count(100), 18)
+        self.assertTrue(any(index != 100 for index in selected))
+
+
+class BrokerTests(QueueFixture, unittest.TestCase):
+    @contextmanager
+    def broker(self):
+        process = subprocess.Popen([sys.executable, str(ROOT / 'metadata_bulk.py'), 'broker', '--run', str(self.folder)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                if process.poll() is not None:
+                    self.fail(process.stderr.read().decode())
+                try:
+                    queue_request(self.folder, 'claim', -1, count=0)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        self.fail('Queue broker did not start')
+                    time.sleep(0.02)
+            yield
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stderr.close()
+
+    def test_concurrent_clients_commit_distinct_jobs_and_resume_after_broker_restart(self):
+        self.initialize([[f'{i:011d}', 'video', 0] for i in range(100)])
+        with self.broker():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                claimed = list(pool.map(lambda w: queue_request(self.folder, 'claim', w, count=50), (0, 1)))
+            self.assertEqual(len({r['video_id'] for group in claimed for r in group}), 100)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda w: queue_request(self.folder, 'finish', w,
+                    events=[event(r['video_id']) for r in claimed[w]]), (0, 1)))
+        with self.broker():
+            self.assertEqual(queue_request(self.folder, 'claim', 0, count=10), [])
+            self.assertEqual(queue_status(self.folder)['counters']['saved'], 100)
+
+    def test_dropped_acknowledgement_does_not_lose_or_duplicate_a_commit(self):
+        self.initialize()
+        with self.broker():
+            queue_request(self.folder, 'claim', 0, count=1)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(str(self.folder / 'queue.sock'))
+                with connection.makefile('wb') as stream:
+                    send_message(stream, {'action': 'finish', 'worker': 0, 'events': [event()]})
+            deadline = time.monotonic() + 5
+            while queue_status(self.folder)['counters']['saved'] != 1:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+            self.assertEqual(queue_request(self.folder, 'claim', 0, count=1), [])
+            with self.assertRaisesRegex(RuntimeError, 'ValueError'):
+                queue_request(self.folder, 'finish', 0, events=[event()])
+            self.assertEqual(queue_status(self.folder)['counters']['saved'], 1)
 
 
 @unittest.skipUnless(os.environ.get('PROXY_TEST_DATABASE') == '1', 'Opt in to isolated database tests')
