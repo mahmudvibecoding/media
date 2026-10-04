@@ -82,6 +82,16 @@ class ParseTests(unittest.TestCase):
                 expected='https://www.youtube.com'+url if url.startswith('/') else url
                 self.assertEqual(result['external_links'],[{'title':'Contact','url':expected}])
 
+    def test_youtube_links_without_a_scheme_are_normalized(self):
+        for url in ('YouTube.com/QiziqarliOlam', 'www.youtube.com/channel/advokat24',
+                    'youtube.com/watch?v=KD7kf57xLoA&t=1528s', 'youtu.be/KD7kf57xLoA'):
+            with self.subTest(url=url):
+                payload=about()
+                payload['onResponseReceivedEndpoints'][0]['aboutChannelViewModel']['links']=[
+                    {'channelExternalLinkViewModel':{'urlEndpoint':{'url':url}}}]
+                result=parse_about(payload,CHANNEL,parse_overview(overview(),CHANNEL))
+                self.assertEqual(result['external_links'],[{'title':None,'url':'https://'+url}])
+
     def test_wrong_ids_missing_about_and_malformed_links_are_rejected(self):
         with self.assertRaises(ResponseShapeError):
             parse_overview(overview('other'),CHANNEL)

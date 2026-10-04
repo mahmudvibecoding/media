@@ -155,6 +155,8 @@ def external_links(about):
         item = item.get('channelExternalLinkViewModel', item)
         destinations = list(nodes(item, 'urlEndpoint'))
         url = next((endpoint.get('url') for endpoint in destinations if isinstance(endpoint.get('url'), str)), None)
+        if url and re.match(r'(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)(?:[/?#]|$)', url, re.I):
+            url = 'https://' + url
         if url and url.startswith('/redirect?'):
             url = 'https://www.youtube.com' + url
         if url and urlsplit(url).hostname in ('www.youtube.com', 'youtube.com'):
