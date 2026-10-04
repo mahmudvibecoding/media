@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import uuid
 
 from proxy_formats import unpack_connection_settings
 from proxy_service_common import SERVICE_DIR, digest, file_lock, utcnow, write_json
@@ -199,7 +200,51 @@ def apply_observations(conn, observations, journal_key, run_id, *, retest_second
     return {"observations": count, "already_imported": False}
 
 
-def import_test_journal(conn, path, *, retest_seconds=21600):
+def record_round_results(conn, round_id, pass_number):
+    """Record one validated pass and publish only complete three-check results."""
+    round_id = str(uuid.UUID(round_id))
+    if type(pass_number) is not int or not 1 <= pass_number <= 3:
+        raise ValueError("A test pass must be 1, 2, or 3")
+    bit = 1 << (pass_number - 1)
+    conn.execute("""INSERT INTO app_meta.proxy_round_results AS r
+        (round_id,proxy_id,passes,response_count,response_time_ms,checked_at,
+         last_response_at,working_protocol,last_http_status)
+        SELECT %s,proxy_id,%s,(http_status IS NOT NULL)::integer,
+            CASE WHEN http_status IS NOT NULL THEN total_ms ELSE 0 END,checked_at,
+            CASE WHEN http_status IS NOT NULL THEN checked_at END,detected_protocol,http_status
+        FROM import_proxy_results ORDER BY proxy_id
+        ON CONFLICT (round_id,proxy_id) DO UPDATE SET
+            passes=r.passes | excluded.passes,
+            response_count=r.response_count+excluded.response_count,
+            response_time_ms=r.response_time_ms+excluded.response_time_ms,
+            checked_at=greatest(r.checked_at,excluded.checked_at),
+            last_response_at=greatest(r.last_response_at,excluded.last_response_at),
+            working_protocol=CASE WHEN excluded.last_response_at IS NOT NULL
+                AND (r.last_response_at IS NULL OR excluded.last_response_at>=r.last_response_at)
+                THEN excluded.working_protocol ELSE r.working_protocol END,
+            last_http_status=CASE WHEN excluded.last_response_at IS NOT NULL
+                AND (r.last_response_at IS NULL OR excluded.last_response_at>=r.last_response_at)
+                THEN excluded.last_http_status ELSE r.last_http_status END
+        WHERE (r.passes & excluded.passes)=0""", (round_id, bit))
+    conn.execute("""INSERT INTO app_meta.proxy_pool_results AS p
+        (proxy_id,round_id,response_count,average_response_ms,completed_at,
+         last_response_at,working_protocol,last_http_status)
+        SELECT r.proxy_id,r.round_id,r.response_count,
+            r.response_time_ms/nullif(r.response_count,0),r.checked_at,
+            r.last_response_at,r.working_protocol,r.last_http_status
+        FROM app_meta.proxy_round_results r JOIN import_proxy_results s USING(proxy_id)
+        WHERE r.round_id=%s AND r.passes=7 ORDER BY r.proxy_id
+        ON CONFLICT(proxy_id) DO UPDATE SET
+            round_id=excluded.round_id,response_count=excluded.response_count,
+            average_response_ms=excluded.average_response_ms,completed_at=excluded.completed_at,
+            last_response_at=excluded.last_response_at,working_protocol=excluded.working_protocol,
+            last_http_status=excluded.last_http_status
+        WHERE excluded.completed_at>p.completed_at""", (round_id,))
+
+
+def import_test_journal(conn, path, *, retest_seconds=21600, round_id=None, pass_number=None):
+    if (round_id is None) != (pass_number is None):
+        raise ValueError("A scored batch needs both its run and pass number")
     # Validate and parse each line once, then transfer staged rows inside PostgreSQL.
     retry_delays = {}
     def observe(result, checked):
@@ -209,8 +254,12 @@ def import_test_journal(conn, path, *, retest_seconds=21600):
             if seconds:
                 retry_delays[result["id"]] = seconds
     report = _journal.import_journal(conn, path, 10000, stage_only=True, on_result=observe)
-    return apply_observations(conn, (), report["journal_key"], report["run"],
-                              retest_seconds=retest_seconds, _staged=True, _retry_delays=retry_delays)
+    with conn.transaction():
+        result = apply_observations(conn, (), report["journal_key"], report["run"],
+                                    retest_seconds=retest_seconds, _staged=True, _retry_delays=retry_delays)
+        if round_id is not None:
+            record_round_results(conn, round_id, pass_number)
+    return result
 
 
 def export_due(conn, folder, *, limit=2000, now=None, after_id=None, max_id=None):
@@ -251,26 +300,22 @@ def export_due(conn, folder, *, limit=2000, now=None, after_id=None, max_id=None
     return manifest
 
 
-def ranked_rows(conn, *, limit=0, max_age_seconds=86400):
-    if limit < 0 or max_age_seconds <= 0:
+def ranked_rows(conn, *, limit=0):
+    if limit < 0:
         raise ValueError("Invalid pool limits")
     with conn.transaction(), conn.cursor(name="ranked_pool_export") as cursor:
         cursor.itersize = 10000
-        cursor.execute("""SELECT h.proxy_id,encode(p.connection_key,'hex'),h.working_protocol,
-            coalesce(h.youtube_score,50)/(1+q.failure_streak) AS rank_score,
-            h.youtube_successful_data_received,h.youtube_responses_received,
-            q.last_response_at,q.latency_ms,h.youtube_last_http_status
-        FROM app_meta.proxy_test_state q JOIN public.proxy_health h USING(proxy_id)
-        JOIN public.proxies p USING(proxy_id)
-        WHERE q.last_response_at>=statement_timestamp()-make_interval(secs=>%s)
-          AND h.working_protocol IS NOT NULL
-        ORDER BY rank_score DESC,h.youtube_weighted_successful_data_received DESC,
-            q.latency_ms ASC NULLS LAST,q.last_response_at DESC,h.proxy_id
-        LIMIT %s""", (max_age_seconds, limit or None))
+        cursor.execute("""SELECT r.proxy_id,encode(p.connection_key,'hex'),r.working_protocol,
+            r.response_count,r.average_response_ms,r.last_response_at,r.last_http_status,
+            r.round_id,r.completed_at
+        FROM app_meta.proxy_pool_results r JOIN public.proxies p USING(proxy_id)
+        WHERE r.response_count>0
+        ORDER BY r.response_count DESC,r.average_response_ms,r.proxy_id
+        LIMIT %s""", (limit or None,))
         yield from cursor
 
 
-def export_pool(conn, home=SERVICE_DIR, *, limit=0, max_age_seconds=86400):
+def export_pool(conn, home=SERVICE_DIR, *, limit=0):
     """Export IDs and ranks; connection credentials remain in the private database."""
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -280,18 +325,19 @@ def export_pool(conn, home=SERVICE_DIR, *, limit=0, max_age_seconds=86400):
         count = 0
         with temporary.open("w") as output:
             os.chmod(temporary, 0o600)
-            for row in ranked_rows(conn, limit=limit, max_age_seconds=max_age_seconds):
-                identifier, key, protocol, score, successes, responses, last_response, latency, status = row
+            for row in ranked_rows(conn, limit=limit):
+                identifier, key, protocol, score, latency, last_response, status, round_id, completed_at = row
                 output.write(json.dumps({"proxy_id": identifier, "connection_key": key, "protocol": protocol,
-                    "score": float(score), "successful_data_received": successes, "youtube_responses": responses,
-                    "last_response_at": last_response.isoformat(), "latency_ms": latency,
-                    "last_http_status": status}, separators=(",", ":")) + "\n")
+                    "score": score, "youtube_responses": score, "checks": 3,
+                    "average_response_ms": latency, "last_response_at": last_response.isoformat(),
+                    "last_http_status": status, "test_run_id": str(round_id),
+                    "tested_at": completed_at.isoformat()}, separators=(",", ":")) + "\n")
                 count += 1
             output.flush()
             os.fsync(output.fileno())
         temporary.replace(path)
         result = {"updated_at": utcnow().isoformat(), "exported": count, "limit": limit,
-                  "max_age_seconds": max_age_seconds, "path": str(path), "sha256": digest(path)}
+                  "scoring": "youtube_responses_last_three", "path": str(path), "sha256": digest(path)}
         write_json(home / "pool-status.json", result)
         return result
 
@@ -302,4 +348,6 @@ def pool_status(conn):
         count(*) FILTER(WHERE next_test_at<=statement_timestamp()) FROM app_meta.proxy_test_state""").fetchone()))
     result["fresh_responders"] = conn.execute("""SELECT count(*) FROM app_meta.proxy_test_state
         WHERE last_response_at>=statement_timestamp()-interval '24 hours'""").fetchone()[0]
+    result["scored"] = conn.execute("SELECT count(*) FROM app_meta.proxy_pool_results").fetchone()[0]
+    result["working"] = conn.execute("SELECT count(*) FROM app_meta.proxy_pool_results WHERE response_count>0").fetchone()[0]
     return result

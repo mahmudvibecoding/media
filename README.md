@@ -69,16 +69,28 @@ saved run. Completed checks and committed imports are not repeated. A concurrent
 invocation fails without starting another run. A fresh run checks for a new
 catalog; a resumed run finishes its already selected catalog first.
 
-Any verified YouTube HTTP response qualifies for the working pool, including
-sign-in challenges and HTTP errors. The export contains **all qualifying proxies,
-ordered by score**, without a size limit. Ranking uses the saved data-retrieval
-history, recent failures, and response latency. These three reachability passes
-do not add separate metadata probes. Entries expire 24 hours after their last
-verified response.
+The score is the **number of verified YouTube responses in the latest completed
+set of three checks**: 3 ranks above 2, then 1. Any HTTP response counts, including
+sign-in challenges, HTTP errors, and a response whose body times out. No response
+content is validated. Ties use the average elapsed check time for the checks that
+received a response, fastest first; timed-out checks with no response do not enter
+that average. Exact ties use proxy ID for stable ordering.
+
+The export contains **all proxies with a score of at least 1**, with no size limit.
+A completed set with zero responses removes that proxy from the pool. A partial
+new set keeps the previous completed score until all three checks finish. Old
+history, failure streaks, data quality, and age do not affect ranking or expire a
+completed result. Before a proxy completes its first set of three checks it has
+no score and is absent from the pool.
+
+Per-run results are saved in `app_meta.proxy_round_results`, and the latest
+completed results in `app_meta.proxy_pool_results`. Lifetime statistics and old
+collector data-quality records remain available as history.
 
 The ranked IDs and statistics are saved at
 `/var/lib/media/state/proxy-service/ranked-proxies.jsonl` in the shared state
-volume; connection settings remain in PostgreSQL. The final summary is saved as
+volume; each record includes `score` (1–3), `checks` (3), `average_response_ms`,
+and `test_run_id`. Connection settings remain in PostgreSQL. The final summary is saved as
 `last-refresh.json` beside it. Collectors can resolve these IDs through the
 catalog loader; automatic collector integration is a separate step.
 
@@ -790,9 +802,10 @@ explains how to add another website's columns.
 Older catalogs can recover missing connection observations from saved test
 journals; see the [backfill guide](db/README.md#historical-connection-backfill).
 
-See [the database scoring guide](db/README.md#recent-proxy-score) for counter names,
-the one-hour weighting, the score query and replay behavior. Historical tester
-results contribute reachability counters and remain unscored for data quality.
+The [database scoring guide](db/README.md#recent-proxy-score) describes the legacy
+collector data-quality records and replay behavior. The working pool uses the
+latest completed three-check response count described above; these historical
+quality records do not affect it.
 
 Every run writes only an aggregate `summary.json` in a new `outputs/` directory,
 with progress, traffic totals, and a histogram of retries per video. Individual

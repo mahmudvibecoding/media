@@ -59,8 +59,10 @@ def verify_manual_proxies():
     report = read_json(SERVICE_DIR/'last-refresh.json')
     assert report['passes_completed'] == 3 and report['observations'] == 6
     assert report['pool']['limit'] == 0
+    assert report['pool']['scoring'] == 'youtube_responses_last_three'
     with connect_database('proxy') as conn:
         assert conn.execute('SELECT connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall() == [(3,), (3,)]
+        assert conn.execute('SELECT response_count FROM app_meta.proxy_pool_results ORDER BY proxy_id').fetchall() == [(0,), (0,)]
     print(json.dumps({'manual_proxy_command':'passed','configurations':2,'passes':3,'observations':6}))
 
 

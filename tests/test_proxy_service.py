@@ -228,6 +228,27 @@ class DatabaseTests(unittest.TestCase):
         return Observation(identifier, key, self.at+timedelta(seconds=seconds), 'http', 'http' if status is not None else None,
             True, True, True, status, data, None, None if data else 'data:no_usable_data', latency)
 
+    def score_pass(self, run_id, pass_number, observations):
+        path = self.folder / f'{run_id}-{pass_number}.jsonl'
+        rows = []
+        for item in observations:
+            responded = item.http_status is not None
+            attempt = {'protocol':'http', 'status':'responds' if responded else 'not_responding',
+                       'connected':True, 'request_sent':True, 'tls_verified':responded}
+            if responded:
+                attempt.update(http_status=item.http_status, body_complete=False, body_error='timeout')
+            else:
+                attempt.update(stage='youtube_headers', error_code='timeout')
+            rows.append({'id':item.proxy_id,'key':item.connection_key.hex(),'declared_protocol':'http',
+                'detected_protocol':'http' if responded else None,'tested_at':item.checked_at.isoformat(),
+                'status':'responds' if responded else 'not_responding', 'attempted':True,
+                'responds':responded,'total_ms':item.latency_ms,'attempts':[attempt]})
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        Path(str(path)+'.meta.json').write_text(json.dumps({'run_id':f'{run_id}-{pass_number}'}))
+        Path(str(path)+'.summary.json').write_text(json.dumps({'state':'complete','counters':
+            {'completed':len(rows),'attempted':len(rows),'youtube_responses':sum(r['responds'] for r in rows)}}))
+        return import_test_journal(self.live,path,round_id=run_id,pass_number=pass_number)
+
     def manifest(self, tag='catalog-test-1', seconds=0):
         manifest = {'format_version': 1, 'repository': sync.DEFAULT_REPOSITORY,
             'created_at': (self.at+timedelta(seconds=seconds)).isoformat(), 'postgres_version': '18.6',
@@ -311,22 +332,60 @@ class DatabaseTests(unittest.TestCase):
             sync.restore_snapshot(self.live, self.folder, manifest,
                 options={**self.options, 'dbname': self.names[0]}, executable=restore_tool)
 
-    def test_any_http_response_qualifies_and_repeated_data_success_ranks_higher(self):
+    def test_last_three_response_count_then_average_response_time_determine_rank(self):
         self.seed(self.live, 5)
-        for round_number in range(3):
-            values = [self.observation(1, data=True, seconds=round_number, latency=200),
-                      self.observation(2, data=False, seconds=round_number, latency=1),
-                      self.observation(3, status=403, data=False, seconds=round_number),
-                      self.observation(4, status=429, data=None, seconds=round_number),
-                      self.observation(5, status=500, data=None, seconds=round_number)]
-            apply_observations(self.live, values, bytes([round_number])*32, f'round-{round_number}', quality=True)
+        run_id = str(uuid.uuid4())
+        apply_observations(self.live,[self.observation(1,data=True,seconds=-100)],b'h'*32,'historical')
+        for number in range(1,4):
+            values = [self.observation(1,status=500,seconds=number,latency=number*300),
+                      self.observation(2,status=403,seconds=number,latency=number*100),
+                      self.observation(3,status=None if number==2 else 429,seconds=number,latency=9000 if number==2 else 400/number),
+                      self.observation(4,status=200 if number==2 else None,seconds=number,latency=20 if number==2 else 9000),
+                      self.observation(5,status=None,seconds=number,latency=9000)]
+            self.score_pass(run_id, number, values)
+            self.score_pass(run_id, number, values)
+            if number<3:
+                self.assertEqual(list(ranked_rows(self.live)), [])
+        self.live.execute('UPDATE app_meta.proxy_test_state SET failure_streak=100 WHERE proxy_id=2')
         ranked = list(ranked_rows(self.live))
-        self.assertEqual(ranked[0][0], 1)
-        self.assertEqual({row[0] for row in ranked}, {1,2,3,4,5})
-        self.assertGreater(ranked[0][3], next(row[3] for row in ranked if row[0] == 2))
+        self.assertEqual([row[0] for row in ranked], [2,1,3,4])
+        self.assertEqual([row[3] for row in ranked], [3,3,2,1])
+        self.assertAlmostEqual(ranked[2][4], (400+400/3)/2)
+        self.assertEqual(ranked[3][4], 20)
+        self.assertEqual(self.live.execute('SELECT sum(connection_attempts) FROM public.proxy_stats').fetchone()[0], 16)
+        self.assertEqual(self.live.execute('SELECT passes,response_count FROM app_meta.proxy_round_results ORDER BY proxy_id').fetchall(), [(7,3),(7,3),(7,2),(7,1),(7,0)])
         report = export_pool(self.live, self.folder)
-        self.assertEqual(report['exported'], 5)
+        self.assertEqual(report['exported'], 4)
+        first = json.loads((self.folder/'ranked-proxies.jsonl').read_text().splitlines()[0])
+        self.assertEqual((first['score'],first['checks'],first['average_response_ms']), (3,3,200))
+        self.assertNotIn('successful_data_received', first)
         self.assertNotIn('password', (self.folder / 'ranked-proxies.jsonl').read_text())
+
+    def test_partial_new_round_keeps_previous_result_then_zero_removes_it(self):
+        self.seed(self.live, 1)
+        old, new, late = (str(uuid.uuid4()) for _ in range(3))
+        for number in (1,2,3):
+            self.score_pass(old,number,[self.observation(1,status=403,seconds=number)])
+        for number in (1,2):
+            self.score_pass(new,number,[self.observation(1,status=None,seconds=100+number)])
+            self.assertEqual(list(ranked_rows(self.live))[0][3], 3)
+        self.score_pass(new,3,[self.observation(1,status=None,seconds=103)])
+        self.assertEqual(list(ranked_rows(self.live)), [])
+        for number in (1,2,3):
+            self.score_pass(late,number,[self.observation(1,status=200,seconds=50+number)])
+        self.assertEqual(list(ranked_rows(self.live)), [])
+        self.assertEqual(str(self.live.execute('SELECT round_id FROM app_meta.proxy_pool_results').fetchone()[0]), new)
+
+    def test_scoring_and_statistics_commit_together(self):
+        self.seed(self.live, 1)
+        run_id = str(uuid.uuid4())
+        with patch('proxy_pool.record_round_results', side_effect=RuntimeError('injected score failure')):
+            with self.assertRaisesRegex(RuntimeError,'score failure'):
+                self.score_pass(run_id,1,[self.observation(1)])
+        self.assertEqual(self.live.execute('SELECT count(*) FROM public.proxy_stats').fetchone()[0], 0)
+        self.assertEqual(self.live.execute('SELECT count(*) FROM app_meta.proxy_observation_imports').fetchone()[0], 0)
+        self.score_pass(run_id,1,[self.observation(1)])
+        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats').fetchone()[0], 1)
 
     def test_late_results_add_counts_once_without_overwriting_newer_outcomes(self):
         self.seed(self.live, 1)
@@ -369,7 +428,8 @@ class DatabaseTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             import_test_journal(self.live, path)
             import_test_journal(self.live, path)
-        self.assertEqual({r[0] for r in ranked_rows(self.live)}, {1,2})
+        self.assertEqual(self.live.execute('SELECT count(*) FROM app_meta.proxy_test_state WHERE last_response_at IS NOT NULL').fetchone()[0], 2)
+        self.assertEqual(list(ranked_rows(self.live)), [])
         self.assertEqual(self.live.execute('SELECT sum(connection_attempts) FROM public.proxy_stats').fetchone()[0], 2)
         self.assertEqual(self.live.execute('SELECT next_test_at FROM app_meta.proxy_test_state WHERE proxy_id=2').fetchone()[0],
                          self.at+timedelta(seconds=40000))
@@ -494,6 +554,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result['passes_completed'], 3)
         self.assertEqual(result['observations'], 9)
         self.assertEqual(result['pool']['exported'], 3)
+        self.assertEqual(self.live.execute('SELECT response_count FROM app_meta.proxy_pool_results ORDER BY proxy_id').fetchall(), [(3,),(3,),(3,)])
         self.assertFalse((self.folder/'current-refresh.json').exists())
         self.assertEqual(self.live.execute('SELECT proxy_id,connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall(), [(1,3),(2,3),(3,3)])
 
@@ -503,6 +564,9 @@ class DatabaseTests(unittest.TestCase):
             FROM generate_series(1,4100) n""")
         self.live.execute("INSERT INTO public.proxy_stats(proxy_id,working_protocol) SELECT proxy_id,'http' FROM public.proxies")
         self.live.execute("INSERT INTO app_meta.proxy_test_state(proxy_id,last_response_at) SELECT proxy_id,clock_timestamp() FROM public.proxies")
+        self.live.execute("""INSERT INTO app_meta.proxy_pool_results
+            (proxy_id,round_id,response_count,average_response_ms,completed_at,last_response_at,working_protocol,last_http_status)
+            SELECT proxy_id,%s,1,20,clock_timestamp(),clock_timestamp(),'http',403 FROM public.proxies""", (str(uuid.uuid4()),))
         report = export_pool(self.live, self.folder)
         self.assertEqual(report['exported'], 4100)
         self.assertEqual(report['limit'], 0)

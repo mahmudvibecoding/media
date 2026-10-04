@@ -97,7 +97,8 @@ def event(kind, **fields):
     print(json.dumps({"event": kind, "at": utcnow(), **fields}, default=str), flush=True)
 
 
-def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False):
+def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False,
+               round_id=None, pass_number=None):
     started = time.monotonic()
     home = Path(home)
     checkpoint = home / "current-test.json"
@@ -111,10 +112,13 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
             return None
         current = {"run_id": run_id, "manifest_sha256": digest(folder / "manifest.json"),
                    "settings": asdict(settings), "phase": "testing",
-                   "after_id": after_id, "max_id": max_id, "last_proxy_id": manifest["last_proxy_id"]}
+                   "after_id": after_id, "max_id": max_id, "last_proxy_id": manifest["last_proxy_id"],
+                   "round_id": round_id, "pass_number": pass_number}
         write_json(checkpoint, current)
     if current.get("after_id") != after_id or current.get("max_id") != max_id:
         raise ValueError("Saved batch belongs to a different catalog range")
+    if current.get("round_id") != round_id or current.get("pass_number") != pass_number:
+        raise ValueError("Saved batch belongs to a different scoring pass")
     if str(uuid.UUID(current["run_id"])) != current["run_id"]:
         raise ValueError("Invalid saved test run")
     folder = home / "runs" / current["run_id"]
@@ -154,7 +158,8 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     tested = time.monotonic()
     status.update(state="importing_tests")
     with connect_database("proxy", autocommit=True) as conn:
-        report = import_test_journal(conn, journal, retest_seconds=settings.retest_interval)
+        report = import_test_journal(conn, journal, retest_seconds=settings.retest_interval,
+                                     round_id=round_id, pass_number=pass_number)
     report["seconds"] = {"prepare": round(exported-started, 2), "test": round(tested-exported, 2),
                          "import": round(time.monotonic()-tested, 2), "total": round(time.monotonic()-started, 2)}
     write_json(folder / "completed.json", {**report, "completed_at": utcnow().isoformat()})
@@ -198,7 +203,8 @@ def refresh(home, settings, stop, status, owner):
         status.update(pass_number=current["pass"], configurations=current["configurations"],
                       observations=current["observations"])
         report = test_batch(batch_home, settings, stop, status, after_id=current["after_id"],
-                            max_id=current["max_id"], retain_checkpoint=True)
+                            max_id=current["max_id"], retain_checkpoint=True,
+                            round_id=current["run_id"], pass_number=current["pass"])
         if report is None:
             event("proxy_pass_completed", pass_number=current["pass"], configurations=current["configurations"])
             current.update({"pass": current["pass"] + 1, "after_id": 0})
@@ -215,6 +221,10 @@ def refresh(home, settings, stop, status, owner):
     if current["observations"] != current["configurations"] * 3:
         raise RuntimeError("Catalog changed during the run; saved counts require inspection")
     with connect_database("proxy", autocommit=True) as conn:
+        scored = conn.execute("SELECT count(*) FROM app_meta.proxy_round_results WHERE round_id=%s AND passes=7",
+                              (current["run_id"],)).fetchone()[0]
+        if scored != current["configurations"]:
+            raise RuntimeError("Scoring is incomplete; the saved run is retained for inspection")
         pool = export_pool(conn, home)
     result = {**current, "passes_completed": 3, "pool": pool, "completed_at": utcnow().isoformat(),
               "seconds": round((utcnow()-datetime.fromisoformat(current["started_at"])).total_seconds(), 2)}
