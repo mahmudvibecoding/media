@@ -112,6 +112,10 @@ def duration(value):
     return f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes}:{seconds:02}'
 
 
+def initial(value):
+    return next((letter.upper() for letter in str(value or '') if letter.isalnum()), '?')
+
+
 def next_path(value):
     if value and value.startswith(('/channels','/videos','/comments')) and '\n' not in value and '\r' not in value:
         return value
@@ -138,7 +142,7 @@ def create_app(settings=None, repository=None):
                        same_site='lax',https_only=settings.secure_cookies,max_age=7*24*3600)
     templates = Jinja2Templates(directory=ROOT/'templates')
     templates.env.filters.update(number=number,compact=compact,date_label=date_label,duration=duration,
-                                 safe_url=safe_url,image_url=image_url,highlight=highlighted)
+                                 safe_url=safe_url,image_url=image_url,highlight=highlighted,initial=initial)
     templates.env.globals.update(SORTS=SORTS,PAGE_SIZE=PAGE_SIZE)
 
     @app.middleware('http')

@@ -171,6 +171,30 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.repo.context(Selection.parse('comments',{'video':video,'channel':'UC'+'0'*21+'1'}))
         self.assertEqual(self.repo.totals()['comments'],115)
 
+    def test_phrase_search_scans_past_nonmatching_batches_and_preserves_pagination(self):
+        self.pool.execute('''INSERT INTO public.comments(video_id,comment_id,text,author_name)
+            SELECT 'V0000000000','batch-'||lpad(n::text,4,'0'),
+            CASE WHEN n>=1000 THEN 'alpha blue quiet river' ELSE 'alpha blue fast quiet river' END,
+            'Batch author' FROM generate_series(0,1149) n''')
+        for sort in ('video','author'):
+            query = 'alpha "blue quiet river"'
+            first = self.repo.search(Selection.parse('comments',{'q':query,'sort':sort}))
+            second = self.repo.search(selection_url(first['next']))
+            third = self.repo.search(selection_url(second['next']))
+            self.assertEqual([row['comment_id'] for row in first['rows']+second['rows']+third['rows']],
+                             [f'batch-{n:04}' for n in range(1000,1150)])
+            self.assertIsNone(third['next'])
+            back = self.repo.search(selection_url(second['previous']))
+            self.assertEqual(back['rows'],first['rows'])
+        # Preserve PostgreSQL's punctuation, OR, and negative-phrase semantics.
+        for query in ('"blue quiet" OR "missing phrase"','alpha -"blue quiet river"','"blue river quiet"'):
+            expected = self.pool.execute('''SELECT video_id,comment_id FROM public.comments WHERE
+                public.media_search_vector(text || ' ' || coalesce(author_name,'')) @@
+                websearch_to_tsquery('simple',public.media_search_normalize(%s)) ORDER BY video_id,comment_id LIMIT 50''',(query,)).fetchall()
+            actual = self.repo.search(Selection.parse('comments',{'q':query}))['rows']
+            self.assertEqual([(row['video_id'],row['comment_id']) for row in actual],
+                             [(row['video_id'],row['comment_id']) for row in expected])
+
     def login(self, client):
         response = client.get('/login')
         csrf = re.search(r'name="csrf" value="([^"]+)"',response.text).group(1)
@@ -195,8 +219,13 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertIn('<mark>blue</mark>',response.text)
             self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;',response.text)
             self.assertNotIn('<script>alert(1)</script>',response.text)
+            response = client.get('/channels?q=collection')
+            self.assertIn('Keywords: <mark>collection</mark>',response.text)
             response = client.get('/comments?detail=shared-comment&detail_video=V0000000000',headers={'HX-Request':'true','HX-Target':'detail-layer'})
             self.assertIn('id="record-drawer"',response.text)
+            self.assertNotIn('id="workspace"',response.text)
+            response = client.get('/comments?detail=missing&detail_video=V0000000000',headers={'HX-Request':'true','HX-Target':'detail-layer'})
+            self.assertEqual(response.status_code,404)
             self.assertNotIn('id="workspace"',response.text)
             response = client.get('/videos?channel=broken',headers={'HX-Request':'true'})
             self.assertEqual(response.status_code,400)

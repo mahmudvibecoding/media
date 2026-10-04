@@ -9,6 +9,7 @@ import time
 from urllib.parse import urlencode
 
 from psycopg.rows import dict_row
+from psycopg.errors import QueryCanceled
 from psycopg_pool import ConnectionPool
 
 from dashboard.search import DOCUMENTS, NAMES, partial_name_query
@@ -35,7 +36,7 @@ SORTS = {
 }
 DEFAULT_SORTS = {kind: next(iter(sorts)) for kind, sorts in SORTS.items()}
 COLUMNS = {
-    'channels': 'channel_id,title,handle,subscriber_count,video_count,view_count,country,avatar_url,description,metadata_updated_at,metadata_error',
+    'channels': 'channel_id,title,handle,subscriber_count,video_count,view_count,country,avatar_url,description,keywords,metadata_updated_at,metadata_error',
     'videos': 'video_id,channel_id,type,published_at,title,description,duration_seconds,thumbnail_url,view_count,like_count,metadata_updated_at',
     'comments': 'video_id,comment_id,text,author_channel_id,author_name,is_pinned',
 }
@@ -145,6 +146,9 @@ class Repository:
                                                (selected.video,)).fetchone()
                 if not result['video'] or selected.channel and result['video']['channel_id'] != selected.channel:
                     raise LookupError('This video is not in the selected library.')
+                if not selected.channel:
+                    result['channel'] = conn.execute('SELECT channel_id,title,handle,avatar_url FROM public.channels WHERE channel_id=%s',
+                                                     (result['video']['channel_id'],)).fetchone()
         return result
 
     def search(self, selected):
@@ -153,8 +157,14 @@ class Repository:
         ties = ['channel_id'] if kind == 'channels' else ['video_id'] if kind == 'videos' else ['comment_id'] if selected.sort == 'video' else ['video_id','comment_id']
         keys = [metric, *ties]
         directions = [direction, *['ASC']*len(ties)]
+        phrase = kind == 'comments' and '"' in selected.q and '-' not in selected.q
+        search_query = "websearch_to_tsquery('simple',public.media_search_normalize(%s))"
         if selected.q:
-            match = f"public.media_search_vector({DOCUMENTS[kind]}) @@ websearch_to_tsquery('simple',public.media_search_normalize(%s))"
+            # GIN stores words, not their positions. Verify a positive phrase
+            # after taking a bounded batch of its word matches, so a common
+            # phrase does not require parsing hundreds of thousands of comments.
+            candidate_query = f"regexp_replace(({search_query})::text,'<->|<[0-9]+>','&','g')::tsquery" if phrase else search_query
+            match = f"public.media_search_vector({DOCUMENTS[kind]}) @@ {candidate_query}"
             params.append(selected.q)
             if kind == 'channels' and partial_name_query(selected.q):
                 pattern = '%'+selected.q.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
@@ -178,6 +188,7 @@ class Repository:
         cursor = self.cursors.decode(selected.cursor, selected.scope) if selected.cursor else None
         previous = bool(cursor and cursor['direction'] == 'previous')
         page = cursor['page'] if cursor else 1
+        values = None
         if cursor:
             values = cursor['keys']
             if len(values) != len(keys):
@@ -193,39 +204,50 @@ class Repository:
                     raise ValueError('Invalid page link.') from exc
             if any(not isinstance(value,str) or len(value)>200 for value in values[1:]):
                 raise ValueError('Invalid page link.')
-            if len(set(directions)) == 1:
-                operator = '>' if (direction == 'ASC') != previous else '<'
-                where.append('('+','.join(keys)+f') {operator} ('+','.join(['%s']*len(keys))+')')
-                params.extend(values)
-            else:
-                # Bound the leading index column before checking tied values.
-                operator = '>=' if (direction == 'ASC') != previous else '<='
-                where.append(f'{metric} {operator} %s')
-                params.append(values[0])
-                terms = []
-                for i, key in enumerate(keys):
-                    gt = (directions[i] == 'ASC') != previous
-                    terms.append('('+' AND '.join([f'{keys[j]}=%s' for j in range(i)]+[f"{key} {'>' if gt else '<'} %s"])+')')
-                    params.extend(values[:i+1])
-                where.append('('+' OR '.join(terms)+')')
         ordering = [flip(direction) if previous else direction for direction in directions]
         order = ','.join(f'{key} {direction}' for key,direction in zip(keys,ordering))
-        query = f"SELECT {COLUMNS[kind]},{metric} AS _key FROM public.{kind}"
-        if where:
-            query += ' WHERE '+' AND '.join(where)
-        query += f' ORDER BY {order} LIMIT {PAGE_SIZE+1}'
-        if kind == 'videos':
-            query = f'''WITH matches AS MATERIALIZED ({query}) SELECT m.*,c.title AS channel_title,c.handle AS channel_handle
-                FROM matches m JOIN public.channels c USING(channel_id)
-                ORDER BY m._key {ordering[0]},m.video_id {ordering[1]}'''
-        elif kind == 'comments':
-            after = ','.join(f'm.{key} {order}' for key,order in zip(['_key',*ties],ordering))
-            query = f'''WITH matches AS MATERIALIZED ({query}) SELECT m.*,v.title AS video_title,v.channel_id,c.title AS channel_title
-                FROM matches m JOIN public.videos v USING(video_id) JOIN public.channels c ON c.channel_id=v.channel_id
-                ORDER BY {after}'''
+        batch_size = 512 if phrase else PAGE_SIZE+1
+
+        def build_query(boundary):
+            filters, arguments = list(where), list(params)
+            if boundary:
+                condition, parameters = page_boundary(keys,directions,boundary,previous)
+                filters.append(condition)
+                arguments.extend(parameters)
+            query = f"SELECT {COLUMNS[kind]},{metric} AS _key FROM public.{kind}"
+            if filters:
+                query += ' WHERE '+' AND '.join(filters)
+            query += f' ORDER BY {order} LIMIT {batch_size}'
+            if phrase:
+                query = f'''WITH candidates AS MATERIALIZED ({query}) SELECT *,
+                    public.media_search_vector({DOCUMENTS[kind]}) @@ {search_query} AS _matches FROM candidates'''
+                arguments.append(selected.q)
+            if kind == 'videos':
+                query = f'''WITH matches AS MATERIALIZED ({query}) SELECT m.*,c.title AS channel_title,c.handle AS channel_handle
+                    FROM matches m JOIN public.channels c USING(channel_id)
+                    ORDER BY m._key {ordering[0]},m.video_id {ordering[1]}'''
+            elif kind == 'comments':
+                after = ','.join(f'm.{key} {order}' for key,order in zip(['_key',*ties],ordering))
+                query = f'''WITH matches AS MATERIALIZED ({query}) SELECT m.*,v.title AS video_title,v.channel_id,c.title AS channel_title
+                    FROM matches m JOIN public.videos v USING(video_id) JOIN public.channels c ON c.channel_id=v.channel_id
+                    ORDER BY {after}'''
+            return query, arguments
+
         began = time.monotonic()
-        with self.pool.connection() as conn:
-            rows = conn.execute(query, params).fetchall()
+        rows = []
+        with self.pool.connection() as conn, conn.transaction():
+            conn.execute("SET LOCAL work_mem='64MB'")
+            while True:
+                remaining = 8000-int((time.monotonic()-began)*1000)
+                if remaining <= 0:
+                    raise QueryCanceled('Search time limit reached')
+                conn.execute("SELECT set_config('statement_timeout',%s,true)",(str(remaining),))
+                query, arguments = build_query(values)
+                batch = conn.execute(query,arguments).fetchall()
+                rows.extend(row for row in batch if row.pop('_matches',True))
+                if not phrase or len(rows)>PAGE_SIZE or len(batch)<batch_size:
+                    break
+                values = [batch[-1]['_key'],*[batch[-1][key] for key in ties]]
         more = len(rows) > PAGE_SIZE
         rows = rows[:PAGE_SIZE]
         if previous:
@@ -264,3 +286,17 @@ class Repository:
 
 def flip(direction):
     return 'DESC' if direction == 'ASC' else 'ASC'
+
+
+def page_boundary(keys, directions, values, previous):
+    if len(set(directions)) == 1:
+        operator = '>' if (directions[0] == 'ASC') != previous else '<'
+        return '('+','.join(keys)+f') {operator} ('+','.join(['%s']*len(keys))+')', list(values)
+    # Bound the leading index column before checking tied values.
+    operator = '>=' if (directions[0] == 'ASC') != previous else '<='
+    parameters, conditions = [values[0]], []
+    for i,key in enumerate(keys):
+        gt = (directions[i] == 'ASC') != previous
+        conditions.append('('+' AND '.join([f'{keys[j]}=%s' for j in range(i)]+[f"{key} {'>' if gt else '<'} %s"])+')')
+        parameters.extend(values[:i+1])
+    return f'{keys[0]} {operator} %s AND ('+' OR '.join(conditions)+')', parameters

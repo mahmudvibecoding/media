@@ -91,8 +91,12 @@ PostgreSQL. Migration `013` installs normalization functions and `pg_trgm`.
 `prepare_dashboard.py` separately creates twelve indexes with `CONCURRENTLY`,
 using up to three database connections and 2 GiB maintenance memory per table.
 It records index-definition hashes and can rebuild an interrupted invalid index.
-Searches have an eight-second statement limit; pagination uses signed cursors
-bound to the current filters. The dashboard role has `SELECT` privileges on
+Searches have an eight-second budget and up to 64 MiB of memory per database
+operation. Positive comment phrases first fetch bounded batches of word matches,
+then verify word positions with PostgreSQL's original phrase query. This keeps
+common phrases from parsing every matching comment before returning one page.
+Pagination uses signed cursors bound to the current filters.
+The dashboard role has `SELECT` privileges on
 the three media tables and uses read-only transactions. Login uses a generated
 password, a PBKDF2 hash, signed HttpOnly sessions, and CSRF protection. For access
 through an HTTPS reverse proxy, set `MEDIA_DASHBOARD_SECURE_COOKIES=1`.

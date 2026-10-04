@@ -42,7 +42,7 @@
     </select>
   </form>
   {% if error %}<div class="error-banner" role="alert">{{ error }} <a href="/{{ selected.kind }}">Start again</a></div>{% endif %}
-  <div class="results-heading" aria-live="polite"><span>{% if selected.q %}Results for <strong>“{{ selected.q }}”</strong>{% else %}All {{ selected.kind }}{% endif %}{% if selected.q %}<a class="clear-search" href="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-get="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Clear</a>{% endif %}</span><span class="keyboard-hint">Press <kbd>/</kbd> to search</span></div>
+  <div class="results-heading" aria-live="polite"><span>{% if selected.q %}Results for <strong>“{{ selected.q }}”</strong>{% else %}All {{ selected.kind }}{% endif %}{% if selected.q %}<a class="clear-search" href="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-get="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Clear</a>{% endif %}</span><span class="keyboard-hint">Use “quotes” for phrases <span aria-hidden="true">·</span> <kbd>/</kbd> to search</span></div>
   {% include 'results.html' %}
   {% if result.rows %}
   <footer class="pagination" aria-label="Pagination">
