@@ -344,6 +344,8 @@ func main() {
 		code, err = audit(os.Args[2:])
 	} else if len(os.Args) > 1 && os.Args[1] == "bridge" {
 		code, err = bridge(os.Args[2:])
+	} else if len(os.Args) > 1 && os.Args[1] == "score" {
+		code, err = score(os.Args[2:])
 	} else {
 		code, err = run(os.Args[1:])
 	}

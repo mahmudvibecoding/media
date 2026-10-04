@@ -598,6 +598,10 @@ def main():
         with connect_database("proxy", autocommit=True) as conn:
             result = {"service": read_json(args.home / "service-status.json"), "counts": pool_status(conn),
                       "pool": read_json(args.home / "pool-status.json"), "catalog": read_json(args.home / "catalog-status.json")}
+        if result["pool"] and result["pool"].get("storage") == "file":
+            finished = read_json(args.home / "last-refresh.json", {})
+            result["counts"].update(scored=finished.get("configurations",0),
+                                    working=result["pool"]["exported"],scoring_storage="file")
         print(json.dumps(result, default=str, indent=2))
         return 0
     settings = Settings.environment()
@@ -618,6 +622,10 @@ def main():
         print(json.dumps(synchronize(settings.repository, home=args.home, stop=stop)))
         return 0
     if args.command == "pool":
+        pool = read_json(args.home / "pool-status.json", {})
+        if pool.get("storage") == "file":
+            print(json.dumps(pool))
+            return 0
         with connect_database("proxy", autocommit=True) as conn:
             print(json.dumps(export_pool(conn, args.home)))
         return 0
@@ -630,14 +638,16 @@ def main():
         if not owner.execute("SELECT pg_try_advisory_lock(hashtextextended('media:proxy_service',0))").fetchone()[0]:
             raise RuntimeError("Another proxy service owns this database")
         # Also seed scheduling for an existing, manually populated installation.
-        owner.execute("""INSERT INTO app_meta.proxy_test_state(proxy_id)
-            SELECT p.proxy_id FROM public.proxies p WHERE NOT EXISTS
-              (SELECT 1 FROM app_meta.proxy_test_state q WHERE q.proxy_id=p.proxy_id)
-            ON CONFLICT DO NOTHING""")
+        if args.command != "refresh":
+            owner.execute("""INSERT INTO app_meta.proxy_test_state(proxy_id)
+                SELECT p.proxy_id FROM public.proxies p WHERE NOT EXISTS
+                  (SELECT 1 FROM app_meta.proxy_test_state q WHERE q.proxy_id=p.proxy_id)
+                ON CONFLICT DO NOTHING""")
         if args.command == "refresh":
             status.thread.start()
             try:
-                print(json.dumps(refresh(args.home, settings, stop, status, owner), default=str))
+                from proxy_file_test import test_catalog
+                print(json.dumps(test_catalog(args.home, settings, stop, status, owner), default=str))
             finally:
                 stop.set()
                 status.thread.join(timeout=6)

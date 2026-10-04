@@ -47,7 +47,7 @@ The YouTube database starts empty. To explicitly import all bundled channel IDs:
 docker compose run --rm backend python manage.py import-channels
 ```
 
-### Manual proxy catalog update and three test passes
+### Manual proxy testing
 
 From the application directory, run:
 
@@ -55,26 +55,20 @@ From the application directory, run:
 sh scripts/update-proxies.sh
 ```
 
-This command checks the latest published [proxy catalog](https://github.com/mahmudvibecoding/proxy-catalog),
-verifies checksums and restored table fingerprints, and imports new configurations
-while preserving IDs and server statistics. It then tests **every configuration
-in that catalog three times**, in three complete passes, with concurrency sized
-from CPU and memory and batches of up to one million. Recently tested proxies are included.
-Input export, network testing, and database imports overlap. Separate import processes
-and network testers use multiple CPU cores. `MEDIA_PROXY_TEST_CONCURRENCY`,
-`MEDIA_PROXY_IMPORT_WORKERS`, and `MEDIA_PROXY_TEST_WORKERS` override the automatic
-sizing; zero selects automatic sizing. Testers share the total network concurrency.
-Each batch has a durable
-checkpoint, and the run cursor advances only after its database commit. Saved
-results can be replayed after a restart without repeating checks or counters.
-A detected local resource overload reduces concurrency for the saved batch.
+This tests **every stored proxy three times** and writes one ranked file. Go
+workers stream the catalog from PostgreSQL and keep scores in memory. There are
+**no per-check database writes, result journals, or resume checkpoints**. The
+previous ranked file remains available until the complete new file replaces it.
+An interrupted run must be started again.
 
-Each invocation runs once and exits with a summary. Setup does not launch the
-background worker. The command runs in the foreground; keep the terminal session
-open until it finishes. If interrupted, invoke the same command to resume the
-saved run. Completed checks and committed imports are not repeated. A concurrent
-invocation fails without starting another run. A fresh run checks for a new
-catalog; a resumed run finishes its already selected catalog first.
+Concurrency and worker count are sized from CPU and memory. Set
+`MEDIA_PROXY_TEST_CONCURRENCY` or `MEDIA_PROXY_TEST_WORKERS` to override them;
+zero selects automatic sizing. The total concurrency is shared across workers.
+A local resource error fails the run without publishing incomplete scores.
+
+The command runs once and exits. It uses the existing catalog; importing a newer
+catalog is a separate explicit `proxy_service.py sync` operation. The background
+worker remains disabled.
 
 The score is the **number of verified YouTube responses in the latest completed
 set of three checks**: 3 ranks above 2, then 1. Any HTTP response counts, including
@@ -90,9 +84,9 @@ history, failure streaks, data quality, and age do not affect ranking or expire 
 completed result. Before a proxy completes its first set of three checks it has
 no score and is absent from the pool.
 
-Per-run results are saved in `app_meta.proxy_round_results`, and the latest
-completed results in `app_meta.proxy_pool_results`. Lifetime statistics and old
-collector data-quality records remain available as history.
+Results are stored in the ranked file. Existing database statistics remain as
+historical records. A one-time transition from an unfinished older run can reuse
+its already committed checks; new runs create no checkpoints.
 
 The ranked IDs and statistics are saved at
 `/var/lib/media/state/proxy-service/ranked-proxies.jsonl` in the shared state
@@ -111,9 +105,6 @@ host network and PostgreSQL binds to `127.0.0.1:55432`. Set `MEDIA_DB_HOST_PORT`
 that port is already used. Database memory and WAL settings can be adjusted with
 `MEDIA_DB_SHARED_BUFFERS` and `MEDIA_DB_MAX_WAL_SIZE`.
 
-Interrupted downloads and unimported journals are preserved. Each invocation
-cleans imported journals older than the configured retention period (default one
-day). The two latest imported snapshot files are retained.
 The catalog publisher remains independent. The legacy background worker is
 available only through the explicit `automatic` Compose profile and is disabled
 by default; the manual command does not enable it.

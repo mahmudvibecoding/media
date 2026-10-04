@@ -1,0 +1,237 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"math"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type scoreInput struct {
+	Candidate
+	ChecksDone   int       `json:"checks_done"`
+	Responses    int       `json:"response_count"`
+	ResponseMS   float64   `json:"response_time_ms"`
+	LastResponse time.Time `json:"last_response_at"`
+	LastHTTP     int       `json:"last_http_status"`
+	TestedAt     time.Time `json:"tested_at"`
+}
+
+type scoredProxy struct {
+	ID           int64     `json:"proxy_id"`
+	Key          string    `json:"connection_key"`
+	Protocol     string    `json:"protocol"`
+	Score        int       `json:"score"`
+	Responses    int       `json:"youtube_responses"`
+	Checks       int       `json:"checks"`
+	AverageMS    float64   `json:"average_response_ms"`
+	LastResponse time.Time `json:"last_response_at"`
+	LastHTTP     int       `json:"last_http_status"`
+	TestedAt     time.Time `json:"tested_at"`
+	RunID        string    `json:"test_run_id"`
+}
+
+type scoreResult struct {
+	Row        scoredProxy
+	Restored   int
+	Performed  int
+	ResponseMS float64
+	Err        error
+}
+
+func scoreOne(ctx context.Context, input scoreInput, options Options, runID string, check func(context.Context, Candidate, Options) Result) scoreResult {
+	out := scoreResult{Restored: input.ChecksDone, ResponseMS: input.ResponseMS}
+	if input.ID < 1 || len(input.Key) != 64 || input.ChecksDone < 0 || input.ChecksDone > 3 || input.Responses < 0 || input.Responses > input.ChecksDone || input.ResponseMS < 0 || math.IsNaN(input.ResponseMS) || math.IsInf(input.ResponseMS, 0) {
+		out.Err = errors.New("invalid scoring input")
+		return out
+	}
+	out.Row = scoredProxy{ID: input.ID, Key: input.Key, Protocol: input.WorkingProtocol, Score: input.Responses,
+		Checks: 3, LastResponse: input.LastResponse, LastHTTP: input.LastHTTP, TestedAt: input.TestedAt, RunID: runID}
+	for n := input.ChecksDone; n < 3; n++ {
+		if ctx.Err() != nil {
+			out.Err = ctx.Err()
+			return out
+		}
+		result := check(ctx, input.Candidate, options)
+		if ctx.Err() != nil {
+			out.Err = ctx.Err()
+			return out
+		}
+		for _, attempt := range result.Attempts {
+			if strings.HasPrefix(attempt.ErrorCode, "local_") {
+				out.Err = errors.New("local resource overload; no final scores published")
+				return out
+			}
+		}
+		out.Performed++
+		out.Row.TestedAt = result.TestedAt
+		if result.Responds {
+			out.Row.Score++
+			out.ResponseMS += result.TotalMS
+			out.Row.Protocol = result.DetectedProtocol
+			out.Row.LastResponse = result.TestedAt
+			for _, attempt := range result.Attempts {
+				if attempt.Status == "responds" {
+					out.Row.LastHTTP = attempt.HTTPStatus
+					break
+				}
+			}
+		}
+	}
+	out.Row.Responses = out.Row.Score
+	if out.Row.Score > 0 {
+		out.Row.AverageMS = out.ResponseMS / float64(out.Row.Score)
+	}
+	return out
+}
+
+// score keeps only responders in RAM. It writes no journal or resume checkpoint.
+func score(args []string) (int, error) {
+	flags := flag.NewFlagSet("score", flag.ContinueOnError)
+	output := flags.String("output", "", "Final responder file")
+	runID := flags.String("run-id", "", "Result identifier")
+	concurrency := flags.Int("concurrency", 1000, "Concurrent checks")
+	expected := flags.Int64("expected", 0, "Required number of input configurations")
+	connectTimeout := flags.Duration("connect-timeout", 3*time.Second, "Connection deadline")
+	totalTimeout := flags.Duration("total-timeout", 10*time.Second, "Protocol attempt deadline")
+	if err := flags.Parse(args); err != nil {
+		return 2, err
+	}
+	if *output == "" || *runID == "" || *concurrency < 1 || *expected < 1 || *connectTimeout <= 0 || *totalTimeout < *connectTimeout {
+		return 2, errors.New("output, run-id, expected count, and positive limits are required")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	jobs := make(chan scoreInput, 4096)
+	results := make(chan scoreResult, 4096)
+	inputDone := make(chan error, 1)
+	go func() {
+		defer close(jobs)
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+		for scanner.Scan() {
+			var input scoreInput
+			if err := json.Unmarshal(scanner.Bytes(), &input); err != nil {
+				inputDone <- errors.New("invalid scoring input JSON")
+				return
+			}
+			select {
+			case jobs <- input:
+			case <-ctx.Done():
+				inputDone <- ctx.Err()
+				return
+			}
+		}
+		inputDone <- scanner.Err()
+	}()
+	options := Options{ConnectTimeout: *connectTimeout, TotalTimeout: *totalTimeout, TargetURL: metadataEndpoint}
+	var workers sync.WaitGroup
+	for range min(*concurrency, int(*expected)) {
+		workers.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case input, ok := <-jobs:
+					if !ok {
+						return
+					}
+					result := scoreOne(ctx, input, options, *runID, checkCandidate)
+					select {
+					case results <- result:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		})
+	}
+	go func() { workers.Wait(); close(results) }()
+	started := time.Now()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var completed, performed, restored, responses int64
+	var responseMS float64
+	var rows []scoredProxy
+	var runError error
+	running := true
+	for running {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				running = false
+				break
+			}
+			if result.Err != nil {
+				runError = result.Err
+				cancel()
+				continue
+			}
+			completed++
+			performed += int64(result.Performed)
+			restored += int64(result.Restored)
+			responses += int64(result.Row.Score)
+			responseMS += result.ResponseMS
+			if result.Row.Score > 0 {
+				rows = append(rows, result.Row)
+			}
+		case <-ticker.C:
+			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "proxy_score_progress", "worker": *output, "completed": completed, "new_checks": performed, "reused_checks": restored, "seconds": time.Since(started).Seconds()})
+		}
+	}
+	if runError != nil {
+		return 1, runError
+	}
+	if ctx.Err() != nil {
+		return 130, ctx.Err()
+	}
+	if err := <-inputDone; err != nil {
+		return 1, err
+	}
+	if completed != *expected || performed+restored != 3*completed {
+		return 1, errors.New("scoring coverage does not match the catalog")
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Score != rows[j].Score {
+			return rows[i].Score > rows[j].Score
+		}
+		if rows[i].AverageMS != rows[j].AverageMS {
+			return rows[i].AverageMS < rows[j].AverageMS
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	f, err := os.OpenFile(*output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 1, err
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	encoder := json.NewEncoder(w)
+	for _, row := range rows {
+		if err = encoder.Encode(row); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = w.Flush()
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return 1, err
+	}
+	if closeErr != nil {
+		return 1, closeErr
+	}
+	return 0, json.NewEncoder(os.Stdout).Encode(map[string]any{"configurations": completed, "new_checks": performed, "reused_checks": restored, "responses": responses, "response_time_ms": responseMS, "working": len(rows), "seconds": time.Since(started).Seconds()})
+}

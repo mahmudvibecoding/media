@@ -667,3 +667,34 @@ class DatabaseTests(unittest.TestCase):
                                      stop,service.Status(self.folder,stop),self.live)
         self.assertEqual(result['observations'], 9)
         self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall(), [(3,), (3,), (3,)])
+
+    def test_file_scorer_reuses_checks_without_database_writes_or_checkpoints(self):
+        if not service.BRIDGE_BINARY.is_file():
+            self.skipTest('Build the Go tester before running this integration check')
+        import proxy_file_test
+        proxy = Proxy('127.0.0.1', 1, 'http', {})
+        self.live.execute('INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at) VALUES (%s,%s,%s,%s,clock_timestamp())',
+            (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
+        run_id = str(uuid.uuid4())
+        for number in (1,2):
+            self.score_pass(run_id, number, [self.observation(1,status=429,seconds=number)])
+        before = self.live.execute('SELECT connection_attempts,youtube_responses_received FROM public.proxy_stats').fetchall()
+        service.write_json(self.folder/'current-refresh.json', {'run_id':run_id,'max_id':1,'configurations':1})
+        def connect(*args, **kwargs):
+            return psycopg.connect(**{**self.options, 'dbname': self.names[0]}, autocommit=True)
+        stop = threading.Event()
+        settings = Settings(test_concurrency=2,connect_timeout=1,request_timeout=1)
+        with patch.object(proxy_file_test, 'connect_database', side_effect=connect):
+            result = proxy_file_test.test_catalog(self.folder,settings,stop,service.Status(self.folder,stop),self.live)
+        self.assertEqual((result['observations'],result['new_checks'],result['reused_checks']), (3,1,2))
+        self.assertFalse(result['checkpoints'])
+        row = json.loads((self.folder/'ranked-proxies.jsonl').read_text())
+        self.assertEqual((row['score'],row['average_response_ms'],row['last_http_status']), (2,20,429))
+        self.assertEqual(self.live.execute('SELECT connection_attempts,youtube_responses_received FROM public.proxy_stats').fetchall(), before)
+        self.assertFalse((self.folder/'current-refresh.json').exists())
+        self.assertFalse(list(self.folder.glob('proxy-results-*')))
+        # A fresh zero-response run atomically replaces the earlier working pool.
+        with patch.object(proxy_file_test, 'connect_database', side_effect=connect):
+            result = proxy_file_test.test_catalog(self.folder,settings,stop,service.Status(self.folder,stop),self.live)
+        self.assertEqual(result['new_checks'],3)
+        self.assertEqual((self.folder/'ranked-proxies.jsonl').read_text(),'')
