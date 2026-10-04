@@ -142,7 +142,7 @@ selection arguments, the next new run collects fresh pending records. Exit code
 2 means unfinished records or errors remain. New IDs arriving during a run wait
 for the next invocation.
 
-### Manual proxy testing
+### Refresh sources and test every proxy
 
 From the application directory, run:
 
@@ -150,11 +150,30 @@ From the application directory, run:
 sh scripts/update-proxies.sh
 ```
 
-This tests **every stored proxy three times** and writes one ranked file. Go
-workers stream the catalog from PostgreSQL and keep scores in memory. There are
-**no per-check database writes, result journals, or resume checkpoints**. The
-previous ranked file remains available until the complete new file replaces it.
-An interrupted run must be started again.
+The command runs these stages in order:
+
+1. Import the latest published GitHub catalog.
+2. Download every enabled feed and API source, follow supported API pagination,
+   parse its current contents, and add new proxy configurations.
+3. Test **every stored proxy three times** and replace the ranked file when the
+   complete test finishes.
+
+Configurations are deduplicated by their connection settings. Existing local IDs
+and statistics stay attached to the same configurations even when GitHub assigns
+different IDs. Disabled source candidates remain disabled. Newly downloaded
+configurations enter the ranked pool only after they receive a test response.
+
+Source downloads and their imported configurations commit together. An
+interrupted source pass resumes on the next invocation, including new URLs added
+by GitHub. Failed URLs are recorded in `failed-sources.jsonl` beside that source
+run's `summary.json`; they do not prevent the catalog test. The next full source
+pass tries them again. The final summary reports imported configurations, new
+configurations found in sources, and source failures separately.
+
+Go workers stream the updated catalog from PostgreSQL and keep test scores in
+memory. There are **no per-check database writes, result journals, or test resume
+checkpoints**. The previous ranked file remains available until the complete new
+file replaces it. An interrupted test restarts all three checks.
 
 Concurrency and worker count are sized from CPU and memory. Set
 `MEDIA_PROXY_TEST_CONCURRENCY` or `MEDIA_PROXY_TEST_WORKERS` to override them;
@@ -162,8 +181,19 @@ zero selects automatic sizing. The total concurrency is shared across workers.
 Temporary local port exhaustion is retried without counting it as a proxy
 failure. Persistent resource errors stop the run without publishing scores.
 
-The command runs once and exits. It uses the existing catalog; importing a newer
-catalog is a separate explicit `proxy_service.py sync` operation.
+The command runs once and exits. Source download concurrency defaults to 128,
+with up to 32 GitHub downloads and 16 downloads per other host. Override these
+with `MEDIA_PROXY_SOURCE_CONCURRENCY`, `MEDIA_PROXY_SOURCE_GITHUB_CONCURRENCY`,
+and `MEDIA_PROXY_SOURCE_PER_HOST`.
+
+To test the current catalog without refreshing it:
+
+```sh
+sh scripts/update-proxies.sh --test-only
+```
+
+`proxy_service.py sync` remains available for a catalog import alone. The import,
+source collector, and tester share a lock to prevent overlapping proxy writes.
 
 The score is the **number of verified YouTube responses in the latest completed
 set of three checks**: 3 ranks above 2, then 1. Any HTTP response counts, including
@@ -182,9 +212,9 @@ no score and is absent from the pool.
 The ranked IDs and statistics are saved at
 `/var/lib/media/state/proxy-service/ranked-proxies.jsonl` in the shared state
 volume; each record includes `score` (1–3), `checks` (3), `average_response_ms`,
-and `test_run_id`. Connection settings remain in PostgreSQL. The final summary is saved as
-`last-refresh.json` beside it. Collectors can resolve these IDs through the
-catalog loader; automatic collector integration is a separate step.
+and `test_run_id`. Connection settings remain in PostgreSQL. The final summary is
+saved as `last-refresh.json` beside it. The bulk discovery and metadata commands
+resolve these IDs through the catalog loader.
 
 ```sh
 docker compose run --rm backend python proxy_service.py status

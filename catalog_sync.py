@@ -314,37 +314,49 @@ def merge_snapshot(live, stage, manifest, pointer):
         live.execute("CREATE UNIQUE INDEX ON incoming_proxies(connection_key)")
         live.execute("ANALYZE incoming_proxies")
         conflicting = live.execute("""SELECT EXISTS(
-            SELECT 1 FROM incoming_proxies s JOIN public.proxies p USING(proxy_id)
-            WHERE (p.connection_key,p.address,p.port,p.connection_settings)
-                IS DISTINCT FROM (s.connection_key,s.address,s.port,s.connection_settings)
-            UNION ALL SELECT 1 FROM incoming_proxies s JOIN public.proxies p USING(connection_key)
-            WHERE p.proxy_id<>s.proxy_id)""").fetchone()[0]
+            SELECT 1 FROM incoming_proxies s JOIN public.proxies p USING(connection_key)
+            WHERE (p.address,p.port,p.connection_settings)
+                IS DISTINCT FROM (s.address,s.port,s.connection_settings))""").fetchone()[0]
         if conflicting:
-            raise ValueError("Catalog proxy IDs or connection identities conflict with local data")
-        live.execute("CREATE TEMP TABLE catalog_new_ids(proxy_id BIGINT PRIMARY KEY) ON COMMIT DROP")
-        fields = sql.SQL(",").join(map(sql.Identifier, proxy_columns))
-        inserted = live.execute(sql.SQL("""WITH added AS (
-            INSERT INTO public.proxies ({}) OVERRIDING SYSTEM VALUE
-            SELECT {} FROM incoming_proxies s WHERE NOT EXISTS
-                (SELECT 1 FROM public.proxies p WHERE p.proxy_id=s.proxy_id)
-            RETURNING proxy_id)
-            INSERT INTO catalog_new_ids SELECT proxy_id FROM added""").format(fields, fields)).rowcount
+            raise ValueError("Catalog connection identities conflict with local data")
+        live.execute("""CREATE TEMP TABLE catalog_new_ids(
+            source_proxy_id BIGINT PRIMARY KEY,proxy_id BIGINT UNIQUE) ON COMMIT DROP""")
+        # IDs are local to each database. Source refreshes can discover the same
+        # configuration on both machines under different numeric IDs.
+        inserted = live.execute("""WITH added AS (
+            INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
+            SELECT s.connection_key,s.address,s.port,s.connection_settings,s.last_seen_at
+            FROM incoming_proxies s WHERE NOT EXISTS
+                (SELECT 1 FROM public.proxies p WHERE p.connection_key=s.connection_key)
+            ORDER BY s.proxy_id
+            ON CONFLICT(connection_key) DO NOTHING RETURNING proxy_id,connection_key)
+            INSERT INTO catalog_new_ids SELECT s.proxy_id,a.proxy_id
+                FROM added a JOIN incoming_proxies s USING(connection_key)""").rowcount
         live.execute("""UPDATE public.proxies p SET last_seen_at=s.last_seen_at
-            FROM incoming_proxies s WHERE p.proxy_id=s.proxy_id AND s.last_seen_at>p.last_seen_at""")
-        stage.execute("CREATE TEMP TABLE catalog_new_ids(proxy_id BIGINT PRIMARY KEY) ON COMMIT DROP")
-        copy_between(live, stage, sql.SQL("SELECT proxy_id FROM catalog_new_ids"), "catalog_new_ids", ["proxy_id"])
+            FROM incoming_proxies s WHERE p.connection_key=s.connection_key AND s.last_seen_at>p.last_seen_at""")
+        stage.execute("""CREATE TEMP TABLE catalog_new_ids(
+            source_proxy_id BIGINT PRIMARY KEY,proxy_id BIGINT UNIQUE) ON COMMIT DROP""")
+        copy_between(live, stage, sql.SQL("SELECT source_proxy_id,proxy_id FROM catalog_new_ids"),
+                     "catalog_new_ids", ["source_proxy_id","proxy_id"])
         stage.execute("ANALYZE catalog_new_ids")
         stat_names = [name for name, _ in expected["proxy_stats"]]
-        copy_between(stage, live, sql.SQL("SELECT {} FROM public.proxy_stats s JOIN catalog_new_ids n USING(proxy_id)").format(
-                         sql.SQL(",").join(sql.Identifier("s", name) for name in stat_names)),
+        copy_between(stage, live, sql.SQL("""SELECT {} FROM public.proxy_stats s
+                         JOIN catalog_new_ids n ON n.source_proxy_id=s.proxy_id""").format(
+                         sql.SQL(",").join(sql.Identifier("n" if name == "proxy_id" else "s", name)
+                                           for name in stat_names)),
                      "incoming_proxy_stats", stat_names)
         live.execute("INSERT INTO public.proxy_stats SELECT * FROM incoming_proxy_stats ON CONFLICT(proxy_id) DO NOTHING")
         list_names = [name for name, _ in expected["proxy_lists"]]
         copy_between(stage, live, sql.SQL("SELECT {} FROM public.proxy_lists").format(
             sql.SQL(",").join(map(sql.Identifier, list_names))), "incoming_proxy_lists", list_names)
-        assignments = sql.SQL(",").join(sql.SQL("{}=excluded.{}").format(sql.Identifier(name), sql.Identifier(name))
-                                        for name in list_names if name != "url")
-        live.execute(sql.SQL("INSERT INTO public.proxy_lists SELECT * FROM incoming_proxy_lists ON CONFLICT(url) DO UPDATE SET {}").format(assignments))
+        state_names = {"run_id","status","fetched_at","fetch_state"}
+        # Publisher run IDs and payload paths cannot be resumed on this machine.
+        # New sources start unchecked; existing sources retain local progress.
+        local_names = [name for name in list_names if name not in state_names]
+        fields = sql.SQL(",").join(map(sql.Identifier, local_names))
+        assignments = sql.SQL(",").join(sql.SQL("{}=excluded.{}").format(sql.Identifier(name),sql.Identifier(name))
+                                        for name in local_names if name != "url")
+        live.execute(sql.SQL("INSERT INTO public.proxy_lists ({}) SELECT {} FROM incoming_proxy_lists ON CONFLICT(url) DO UPDATE SET {}").format(fields,fields,assignments))
         sequence = live.execute("SELECT pg_get_serial_sequence('public.proxies','proxy_id')").fetchone()[0]
         current_value = live.execute(sql.SQL("SELECT last_value FROM {}").format(sql.Identifier(*sequence.split(".")))).fetchone()[0]
         maximum = live.execute("SELECT max(proxy_id) FROM public.proxies").fetchone()[0]
@@ -368,7 +380,7 @@ def clean_catalogs(live, home):
             shutil.rmtree(folder)
 
 
-def synchronize(repository=DEFAULT_REPOSITORY, *, home=SERVICE_DIR, client=None, stop=None):
+def synchronize(repository=DEFAULT_REPOSITORY, *, home=SERVICE_DIR, client=None, stop=None, exclusive_owner=None):
     repository = validate_repository(repository)
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -376,6 +388,9 @@ def synchronize(repository=DEFAULT_REPOSITORY, *, home=SERVICE_DIR, client=None,
     client = client or httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30, connect=15),
                                    headers={"User-Agent": "media-proxy-service/1"})
     with (client if own_client else nullcontext(client)) as client, connect_database("proxy", autocommit=True) as live:
+        if exclusive_owner is None and not live.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended('media:proxy_service',0))").fetchone()[0]:
+            raise RuntimeError("Another proxy refresh or test is running")
         if not live.execute("SELECT pg_try_advisory_lock(hashtextextended('media:catalog_sync',0))").fetchone()[0]:
             raise RuntimeError("Another catalog synchronization is running")
         pointer, _ = fetch_document(client, f"https://raw.githubusercontent.com/{repository}/main/latest.json", limit=65536)

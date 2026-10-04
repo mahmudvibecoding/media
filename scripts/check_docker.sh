@@ -42,7 +42,7 @@ if ! compose run --rm -e MEDIA_TEST_DATABASE_URL=dbname=media \
 fi
 tail -5 "$report_dir/python-tests.log"
 compose run --rm backend python scripts/docker_smoke.py prepare-proxies
-COMPOSE_ENV_FILES="$credentials" sh scripts/update-proxies.sh
+COMPOSE_ENV_FILES="$credentials" sh scripts/update-proxies.sh --test-only
 compose run --rm backend python scripts/docker_smoke.py verify-proxies
 compose run --rm backend python scripts/docker_smoke.py collect
 compose down

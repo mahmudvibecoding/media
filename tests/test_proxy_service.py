@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import uuid
 
 import httpx
@@ -22,6 +22,7 @@ from psycopg.types.json import Jsonb
 
 import proxy_service as service
 import catalog_sync as sync
+import collect_proxies as sources
 from database_helpers import connect_test_database
 from proxy_formats import Proxy, pack_connection_settings
 from proxy_service import Settings
@@ -206,14 +207,14 @@ class DatabaseTests(unittest.TestCase):
     def test_identity_conflict_and_late_import_failure_leave_live_generation_unchanged(self):
         self.seed(self.source, 3)
         self.seed(self.live, 1)
-        self.live.execute("UPDATE public.proxies SET connection_key=%s", (b'x'*32,))
+        self.live.execute("UPDATE public.proxies SET address='different.example'")
         manifest, pointer = self.manifest()
         with self.assertRaisesRegex(ValueError, 'conflict'):
             sync.merge_snapshot(self.live, self.source, manifest, pointer)
         self.assertEqual(self.live.execute('SELECT count(*) FROM public.proxies').fetchone()[0], 1)
         self.assertEqual(self.live.execute('SELECT count(*) FROM app_meta.catalog_imports').fetchone()[0], 0)
-        self.live.execute('UPDATE public.proxies SET connection_key=%s',
-                          (self.source.execute('SELECT connection_key FROM public.proxies WHERE proxy_id=1').fetchone()[0],))
+        self.live.execute('UPDATE public.proxies SET address=%s',
+                          (self.source.execute('SELECT address FROM public.proxies WHERE proxy_id=1').fetchone()[0],))
         original = sync.copy_between
         def failed(source, destination, query, target, names):
             if target == 'incoming_proxy_stats':
@@ -224,6 +225,135 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.live.execute('SELECT count(*) FROM public.proxies').fetchone()[0], 1)
         self.assertEqual(self.live.execute('SELECT count(*) FROM app_meta.catalog_imports').fetchone()[0], 0)
         self.assertEqual(sync.merge_snapshot(self.live, self.source, manifest, pointer)['inserted'], 2)
+
+    def test_local_discovery_and_github_ids_can_diverge_without_changing_saved_ids(self):
+        self.seed(self.source,1)
+        manifest,pointer=self.manifest()
+        sync.merge_snapshot(self.live,self.source,manifest,pointer)
+        local=Proxy('1.1.1.1',8080,'http',{})
+        local_id=self.live.execute('''INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
+            VALUES (%s,%s,%s,%s,%s) RETURNING proxy_id''',
+            (local.key,local.address,local.port,Jsonb(pack_connection_settings(local.protocol,local.settings)),self.at)).fetchone()[0]
+        self.assertEqual(local_id,2)
+        # GitHub independently assigns 2 to a different configuration and 3 to
+        # the configuration this database already discovered as local ID 2.
+        self.source.execute('''INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
+            SELECT %s,%s,8080,%s,%s''',(b'n'*32,'8.8.8.8',Jsonb({'transport':'http','options':{}}),self.at))
+        self.source.execute('''INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
+            VALUES (%s,%s,%s,%s,%s)''',
+            (local.key,local.address,local.port,Jsonb(pack_connection_settings(local.protocol,local.settings)),self.at))
+        self.seed_statistics(self.source)
+        self.source.execute('UPDATE public.proxy_stats SET proxy_id=2')
+        self.seed_statistics(self.live)
+        self.live.execute('UPDATE public.proxy_stats SET proxy_id=2')
+        old_stats=self.live.execute('SELECT * FROM public.proxy_stats WHERE proxy_id=2').fetchone()
+        later,pointer=self.manifest('catalog-diverged',seconds=5)
+        result=sync.merge_snapshot(self.live,self.source,later,pointer)
+        self.assertEqual(result['inserted'],1)
+        self.assertEqual(self.live.execute('SELECT proxy_id FROM public.proxies WHERE connection_key=%s',(local.key,)).fetchone()[0],2)
+        new_id=self.live.execute('SELECT proxy_id FROM public.proxies WHERE connection_key=%s',(b'n'*32,)).fetchone()[0]
+        self.assertNotEqual(new_id,2)
+        self.assertEqual(self.live.execute('SELECT * FROM public.proxy_stats WHERE proxy_id=2').fetchone(),old_stats)
+        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats WHERE proxy_id=%s',(new_id,)).fetchone()[0],1)
+        self.assertTrue(sync.merge_snapshot(self.live,self.source,later,pointer)['already_imported'])
+
+    def test_catalog_merge_preserves_local_source_progress(self):
+        self.seed(self.source,1)
+        url='https://feeds.example.test/proxies.txt'
+        self.source.execute("INSERT INTO public.proxy_lists(url,kind,enabled) VALUES (%s,'feed_candidate',true)",(url,))
+        manifest,pointer=self.manifest()
+        sync.merge_snapshot(self.live,self.source,manifest,pointer)
+        run=uuid.uuid4()
+        self.live.execute("UPDATE public.proxy_lists SET run_id=%s,status='pending',fetch_state=%s",(run,Jsonb({'local':'state'})))
+        self.source.execute("UPDATE public.proxy_lists SET run_id=%s,status='collected',fetch_state=%s",(uuid.uuid4(),Jsonb({'foreign':'path'})))
+        new_url='https://feeds.example.test/new.txt'
+        self.source.execute("""INSERT INTO public.proxy_lists(url,kind,enabled,run_id,status,fetch_state)
+            VALUES (%s,'feed_candidate',true,%s,'pending',%s)""",(new_url,uuid.uuid4(),Jsonb({'foreign':'unfinished'})))
+        manifest,pointer=self.manifest('catalog-next',seconds=5)
+        sync.merge_snapshot(self.live,self.source,manifest,pointer)
+        self.assertEqual(self.live.execute('SELECT run_id,status,fetch_state FROM public.proxy_lists WHERE url=%s',(url,)).fetchone(),(run,'pending',{'local':'state'}))
+        self.assertEqual(self.live.execute('SELECT run_id,status,fetch_state FROM public.proxy_lists WHERE url=%s',(new_url,)).fetchone(),(None,'not_checked',{}))
+
+    def source_connection(self):
+        from psycopg.rows import dict_row
+        return psycopg.connect(**{**self.options,'dbname':self.names[0]},autocommit=True,row_factory=dict_row)
+
+    def test_full_refresh_imports_downloads_deduplicates_and_tests_despite_source_failure(self):
+        self.seed(self.source,1)
+        self.source.execute("""INSERT INTO public.proxy_lists(url,kind,protocol_hints,enabled) VALUES
+            ('https://feeds.example.test/good','feed_candidate',ARRAY['http'],true),
+            ('https://feeds.example.test/broken','feed_candidate',ARRAY['http'],true),
+            ('https://feeds.example.test/disabled','feed_candidate',ARRAY['http'],false)""")
+        manifest,pointer=self.manifest()
+        order=[]
+        def import_catalog(*args,**kwargs):
+            order.append('import')
+            return sync.merge_snapshot(self.live,self.source,manifest,pointer)
+        requested=[]
+        def response(request):
+            requested.append(request.url.path)
+            order.append('download')
+            return httpx.Response(404) if request.url.path=='/broken' else httpx.Response(200,content=b'8.8.8.8:3128\n8.8.8.8:3128\n')
+        real_client=httpx.AsyncClient
+        def client(**options):
+            return real_client(transport=httpx.MockTransport(response),**options)
+        def test_catalog(*args):
+            order.append('test')
+            self.assertEqual(self.live.execute('SELECT count(*) FROM public.proxies').fetchone()[0],2)
+            return {'configurations':2,'new_checks':6}
+        stop=threading.Event()
+        with patch.object(service,'synchronize',side_effect=import_catalog), \
+             patch.object(sources,'connection',side_effect=self.source_connection), \
+             patch.object(sources,'STORAGE',self.folder/'sources'), \
+             patch.object(sources.Downloader,'public_url',new=AsyncMock(return_value=True)), \
+             patch.object(httpx,'AsyncClient',side_effect=client), \
+             patch.object(service,'test_catalog',side_effect=test_catalog):
+            result=service.refresh(Settings(),self.folder,stop,service.Status(self.folder,stop),self.live)
+            self.assertEqual(result['sources']['new_configurations'],1)
+            self.assertEqual(result['sources']['source_errors'],1)
+            self.assertEqual((order[0],order[-1]),('import','test'))
+            self.assertEqual(set(requested),{'/good','/broken'})
+            again=service.refresh(Settings(),self.folder,stop,service.Status(self.folder,stop),self.live)
+        self.assertEqual(again['sources']['new_configurations'],0)
+        self.assertEqual(json.loads((self.folder/'last-refresh.json').read_text())['new_checks'],6)
+        failed=Path(again['sources']['failed_sources_path']).read_text().splitlines()
+        self.assertEqual(json.loads(failed[0])['status'],'http_404')
+
+    def test_source_refresh_stops_and_resumes_with_newly_added_urls(self):
+        import asyncio
+        self.live.execute("""INSERT INTO public.proxy_lists(url,kind,protocol_hints,enabled) VALUES
+            ('https://feeds.example.test/first','feed_candidate',ARRAY['http'],true),
+            ('https://feeds.example.test/second','feed_candidate',ARRAY['http'],true)""")
+        stop=threading.Event()
+        async def interrupted(request):
+            if request.url.path=='/second':
+                while self.live.execute("SELECT status FROM public.proxy_lists WHERE url LIKE '%/first'").fetchone()[0]!='collected':
+                    await asyncio.sleep(.01)
+                stop.set()
+                await asyncio.sleep(60)
+            return httpx.Response(200,content=b'8.8.8.8:3128\n')
+        real_client=httpx.AsyncClient
+        options=sources.argument_parser().parse_args(['--concurrency','1'])
+        options.auto_resume,options.inventory=True,False
+        with patch.object(sources,'connection',side_effect=self.source_connection), \
+             patch.object(sources,'STORAGE',self.folder/'sources'), \
+             patch.object(sources.Downloader,'public_url',new=AsyncMock(return_value=True)):
+            with patch.object(httpx,'AsyncClient',side_effect=lambda **kw:real_client(transport=httpx.MockTransport(interrupted),**kw)):
+                with self.assertRaises(InterruptedError):
+                    asyncio.run(sources.main(options,exclusive_owner=self.live,stop=stop))
+            self.assertEqual(self.live.execute("SELECT count(*) FROM public.proxy_lists WHERE status='pending'").fetchone()[0],1)
+            self.assertEqual(self.live.execute('SELECT count(*) FROM public.proxies').fetchone()[0],1)
+            self.live.execute("""INSERT INTO public.proxy_lists(url,kind,protocol_hints,enabled)
+                VALUES ('https://feeds.example.test/new','feed_candidate',ARRAY['http'],true)""")
+            requested=[]
+            def resumed(request):
+                requested.append(request.url.path)
+                return httpx.Response(200,content=b'1.1.1.1:3128\n')
+            stop.clear()
+            with patch.object(httpx,'AsyncClient',side_effect=lambda **kw:real_client(transport=httpx.MockTransport(resumed),**kw)):
+                result=asyncio.run(sources.main(options,exclusive_owner=self.live,stop=stop))
+        self.assertEqual(set(requested),{'/second','/new'})
+        self.assertEqual((result['selected_urls'],result['new_configurations'],result['pending_sources']),(3,2,0))
 
     def test_actual_custom_dump_restore_checks_every_row_and_sequence(self):
         self.seed(self.source, 3)

@@ -27,6 +27,7 @@ from psycopg.types.json import Jsonb
 
 from proxy_formats import PARSER_VERSION, Proxy, canonical_json, pack_connection_settings, parse_proxies
 from proxy_pagination import next_page
+from proxy_service_common import write_json
 from runtime_config import ROOT, STATE_DIR, connect_database
 
 STORAGE = STATE_DIR / 'proxy-collection'
@@ -35,6 +36,7 @@ DOWNLOAD_COLUMNS = (
     'content_type', 'decoded_bytes', 'received_body_bytes', 'content_sha256', 'payload_path',
     'entries_found', 'unique_entries', 'duplicates_in_list', 'invalid_entries',
     'parser_details', 'error_type', 'elapsed_seconds',
+    'new_configurations', 'existing_configurations',
 )
 
 
@@ -78,12 +80,18 @@ def same_parsed_entries(left, right):
 
 
 class Store:
-    def __init__(self):
+    def __init__(self, exclusive_owner=None):
         self.control = connection()
+        if exclusive_owner is None and not self.control.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended('media:proxy_service',0)) AS locked"
+        ).fetchone()['locked']:
+            self.control.close()
+            raise RuntimeError('Another proxy refresh or test is running')
         locked = self.control.execute(
             "SELECT pg_try_advisory_lock(hashtextextended('proxy:proxy_collection',0)) AS locked"
         ).fetchone()['locked']
         if not locked:
+            self.control.close()
             raise RuntimeError('Another proxy collector is already running')
         self.writer = connection()
         self.writer.execute("SET lock_timeout = '30s'")
@@ -100,6 +108,15 @@ class Store:
                                           (self.run_id,)).fetchone()
             if not exists:
                 raise ValueError('Unknown or superseded collection run')
+            if getattr(args,'auto_resume',False):
+                # Include sources added by a newer catalog while finishing the
+                # earlier source pass; completed URLs in that pass stay saved.
+                self.control.execute("""UPDATE proxy_lists SET run_id=%s,status='pending',fetched_at=NULL,fetch_state='{}'
+                    WHERE enabled AND kind IN ('feed_candidate','api_candidate') AND run_id IS DISTINCT FROM %s""",
+                    (self.run_id,self.run_id))
+                self.control.execute("""UPDATE proxy_lists SET run_id=NULL,status='not_checked'
+                    WHERE run_id=%s AND status='pending' AND
+                    (NOT enabled OR kind NOT IN ('feed_candidate','api_candidate'))""",(self.run_id,))
             if args.retry_failures:
                 self.control.execute("""UPDATE proxy_lists SET status='pending'
                     WHERE run_id=%s AND status NOT IN ('collected','pending')""", (self.run_id,))
@@ -183,6 +200,7 @@ class Store:
         with self.writer.transaction():
             self.writer.execute('TRUNCATE proxy_stage')
             unchanged_entries = False
+            result['new_configurations'] = 0
             if result.get('reparse') and cache:
                 previous = self.writer.execute('SELECT fetch_state,fetched_at FROM proxy_lists WHERE run_id=%s AND url=%s',
                                                (self.run_id,result['list_url'])).fetchone()
@@ -202,12 +220,16 @@ class Store:
                             proxy = Proxy(row['address'], row['port'], row['protocol'], row['settings'])
                             cp.write_row((proxy.key, proxy.address, proxy.port,
                                           stored_settings(proxy.settings, proxy.protocol)))
-                self.writer.execute('''INSERT INTO proxies
+                self.writer.execute('ANALYZE proxy_stage')
+                result['new_configurations'] = self.writer.execute('''WITH added AS (INSERT INTO proxies
                     (connection_key,address,port,connection_settings,last_seen_at)
-                    SELECT connection_key,address,port,connection_settings,%s FROM proxy_stage
-                    ON CONFLICT (connection_key) DO UPDATE SET
-                        last_seen_at=GREATEST(proxies.last_seen_at,excluded.last_seen_at)
-                    WHERE excluded.last_seen_at > proxies.last_seen_at''', (observed,))
+                    SELECT s.connection_key,s.address,s.port,s.connection_settings,%s FROM proxy_stage s
+                    WHERE NOT EXISTS(SELECT 1 FROM proxies p WHERE p.connection_key=s.connection_key)
+                    ON CONFLICT (connection_key) DO NOTHING RETURNING proxy_id)
+                    SELECT count(*) AS n FROM added''', (observed,)).fetchone()['n']
+                self.writer.execute('''UPDATE proxies p SET last_seen_at=%s FROM proxy_stage s
+                    WHERE p.connection_key=s.connection_key AND p.last_seen_at<%s''', (observed,observed))
+            result['existing_configurations'] = (result.get('unique_entries') or 0)-result['new_configurations']
             # Membership history is intentionally absent. Reparsing can add corrected
             # configurations but cannot prove an old one is safe to delete.
             state = {key: result.get(key) for key in DOWNLOAD_COLUMNS
@@ -218,35 +240,49 @@ class Store:
                 (result['status'],observed,Jsonb(state),self.run_id,result['list_url']))
             if updated.rowcount != 1:
                 raise RuntimeError('Current list record missing; proxy observations rolled back')
-        return {'status': result['status'], 'unique_entries': result.get('unique_entries', 0) or 0}
+        return {'status': result['status'], 'unique_entries': result.get('unique_entries', 0) or 0,
+                'new_configurations': result['new_configurations']}
 
     def progress(self):
         rows = self.control.execute('SELECT status,count(*) AS n FROM proxy_lists WHERE run_id=%s GROUP BY status ORDER BY status',
                                     (self.run_id,)).fetchall()
         return {r['status']: r['n'] for r in rows}
 
-    def finish(self, failed=False):
+    def finish(self, failed=False, inventory=True):
         statuses = self.progress()
         summary = dict(self.control.execute("""SELECT count(*) AS selected_urls,
             count(*) FILTER (WHERE status IN ('collected','collected_partial')) AS urls_with_imported_entries,
             count(*) FILTER (WHERE fetch_state->>'payload_path' IS NOT NULL) AS downloaded_urls,
-            sum((fetch_state->>'entries_found')::bigint) AS entries_found,
-            sum((fetch_state->>'unique_entries')::bigint) AS unique_entries_summed_across_lists,
-            sum((fetch_state->>'decoded_bytes')::bigint) AS decoded_response_bytes,
-            sum((fetch_state->>'attempts')::bigint) AS download_attempts
+            sum((fetch_state->>'entries_found')::bigint)::bigint AS entries_found,
+            sum((fetch_state->>'unique_entries')::bigint)::bigint AS unique_entries_summed_across_lists,
+            sum((fetch_state->>'decoded_bytes')::bigint)::bigint AS decoded_response_bytes,
+            sum((fetch_state->>'attempts')::bigint)::bigint AS download_attempts,
+            coalesce(sum((fetch_state->>'new_configurations')::bigint),0)::bigint AS new_configurations,
+            count(*) FILTER (WHERE status NOT IN ('collected','no_entries','pending')) AS source_errors,
+            count(*) FILTER (WHERE status='pending') AS pending_sources
             FROM proxy_lists WHERE run_id=%s""", (self.run_id,)).fetchone())
         summary.update(statuses=statuses,run_id=str(self.run_id),
                        status='failed' if failed else ('unfinished' if statuses.get('pending') else 'completed'))
-        summary['database_totals'] = self.control.execute("""SELECT count(*) AS unique_connections,
+        if inventory:
+            summary['database_totals'] = self.control.execute("""SELECT count(*) AS unique_connections,
             count(DISTINCT (address,port)) AS unique_addresses_and_ports,
             (SELECT count(*) FROM proxy_stats WHERE connection_attempts > 0) AS individually_tested
             FROM proxies""").fetchone()
-        summary['protocol_counts'] = {r['protocol']: r['n'] for r in self.control.execute(
-            "SELECT connection_settings->>'transport' AS protocol,count(*) AS n "
-            "FROM proxies GROUP BY connection_settings->>'transport' ORDER BY count(*) DESC").fetchall()}
+            summary['protocol_counts'] = {r['protocol']: r['n'] for r in self.control.execute(
+                "SELECT connection_settings->>'transport' AS protocol,count(*) AS n "
+                "FROM proxies GROUP BY connection_settings->>'transport' ORDER BY count(*) DESC").fetchall()}
         path = STORAGE / 'runs' / str(self.run_id) / 'summary.json'
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(summary, default=int, indent=2) + '\n')
+        summary['summary_path'] = str(path)
+        summary['failed_sources_path'] = str(path.with_name('failed-sources.jsonl'))
+        with path.with_name('failed-sources.jsonl').open('w') as output_file:
+            for row in self.control.execute('''SELECT url,status,fetch_state->>'error_type' AS error_type
+                FROM proxy_lists WHERE run_id=%s AND status NOT IN ('collected','no_entries') ORDER BY url''',
+                (self.run_id,)):
+                output_file.write(json.dumps(row)+'\n')
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        write_json(path,summary)
         return summary
 
     def close(self):
@@ -471,17 +507,24 @@ class Downloader:
         return result
 
 
-async def main(args):
+async def main(args, *, exclusive_owner=None, stop=None, on_progress=None):
     os.umask(0o077)
     for sub in ('payloads', 'parsed', 'tmp', 'runs'):
         (STORAGE / sub).mkdir(parents=True, exist_ok=True)
-    store = Store()
+    store = Store(exclusive_owner=exclusive_owner)
     downloader = Downloader(args)
     began = time.monotonic()
     queue = asyncio.Queue(maxsize=max(2, args.concurrency))
     finished = 0
     failed = False
     try:
+        if getattr(args, 'auto_resume', False) and not args.run_id:
+            pending = store.control.execute('''SELECT DISTINCT run_id FROM proxy_lists
+                WHERE run_id IS NOT NULL AND status='pending' ''').fetchall()
+            if len(pending) > 1:
+                raise ValueError('Several unfinished source runs require explicit recovery')
+            if pending:
+                args.run_id = str(pending[0]['run_id'])
         work = store.prepare(args)
         output({'run_id': str(store.run_id), 'urls_to_process': len(work),
                 'concurrency': args.concurrency, 'github_concurrency': args.github_concurrency,
@@ -519,31 +562,53 @@ async def main(args):
 
         async def progress():
             while True:
-                await asyncio.sleep(25)
-                output({'saved_this_invocation': finished, 'selected_this_invocation': len(work),
-                        'elapsed_seconds': round(time.monotonic() - began, 1), 'statuses': store.progress()})
+                await asyncio.sleep(10)
+                values = {'saved_this_invocation': finished, 'selected_this_invocation': len(work),
+                          'elapsed_seconds': round(time.monotonic() - began, 1), 'statuses': store.progress()}
+                output(values)
+                if on_progress:
+                    on_progress(values)
 
-        progress_task = asyncio.create_task(progress())
-        try:
+        async def collect_tasks():
             async with asyncio.TaskGroup() as group:
                 group.create_task(producer())
                 group.create_task(consumer())
+
+        async def wait_for_stop():
+            while stop is None or not stop.is_set():
+                await asyncio.sleep(0.2)
+
+        progress_task = asyncio.create_task(progress())
+        collection_task = asyncio.create_task(collect_tasks())
+        stop_task = asyncio.create_task(wait_for_stop())
+        try:
+            done,_ = await asyncio.wait((collection_task,stop_task),return_when=asyncio.FIRST_COMPLETED)
+            if stop_task in done:
+                collection_task.cancel()
+                await asyncio.gather(collection_task,return_exceptions=True)
+                raise InterruptedError('Source refresh stopped; completed source commits were preserved')
+            await collection_task
         finally:
-            progress_task.cancel()
-            await asyncio.gather(progress_task, return_exceptions=True)
+            for task in (progress_task,collection_task,stop_task):
+                task.cancel()
+            await asyncio.gather(progress_task,collection_task,stop_task,return_exceptions=True)
     except BaseException:
         failed = True
         raise
     finally:
-        await downloader.client.aclose()
-        if store.run_id is not None:
-            summary = store.finish(failed=failed)
-            summary['invocation_seconds'] = round(time.monotonic() - began, 2)
-            output(summary)
-        store.close()
+        try:
+            await downloader.client.aclose()
+            if store.run_id is not None:
+                summary = store.finish(failed=failed,inventory=getattr(args,'inventory',True))
+                summary['invocation_seconds'] = round(time.monotonic() - began, 2)
+                write_json(summary['summary_path'],summary)
+                output(summary)
+        finally:
+            store.close()
+    return summary
 
 
-if __name__ == '__main__':
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-id', help='Resume a saved run and process its pending list URLs')
     parser.add_argument('--take', type=int, help='Process only this many pending URLs, leaving the rest for resume')
@@ -556,6 +621,11 @@ if __name__ == '__main__':
     parser.add_argument('--retries', type=int, default=2)
     parser.add_argument('--max-bytes', type=int, default=256 * 1024 * 1024,
                         help='Maximum decoded bytes per list; oversized responses are recorded as incomplete')
+    return parser
+
+
+if __name__ == '__main__':
+    parser = argument_parser()
     parsed_args = parser.parse_args()
     if min(parsed_args.concurrency, parsed_args.per_host, parsed_args.github_concurrency, parsed_args.max_bytes) < 1:
         parser.error('Concurrency and maximum size must be positive')
