@@ -146,7 +146,7 @@ def apply_staged(conn, journal_key):
     return inserted
 
 
-def import_journal(conn, journal, batch_size, source_host=None, *, stage_only=False):
+def import_journal(conn, journal, batch_size, source_host=None, *, stage_only=False, on_result=None):
     journal = Path(journal)
     base = Path(str(journal).removesuffix('.gz'))
     metadata = json.loads(Path(str(base) + '.meta.json').read_text())
@@ -202,6 +202,8 @@ def import_journal(conn, journal, batch_size, source_host=None, *, stage_only=Fa
                          result['responds'],result['declared_protocol'],result.get('detected_protocol'),
                          replies[0]['http_status'] if replies else None,result['total_ms'],requests,
                          connected,connection_error,website_error(result,connection_error)))
+            if on_result is not None:
+                on_result(result, checked)
             count += 1
             attempted_count += result['attempted']
             response_count += result['responds']

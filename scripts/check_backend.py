@@ -77,6 +77,7 @@ def main():
             env[f"{database.upper()}_TEST_DATABASE_URL"] = (
                 f"host={sock} port=5432 user=media_test dbname={database} connect_timeout=5")
         env["PROXY_TEST_DATABASE"] = "1"
+        env["MEDIA_TEST_PG_BIN"] = str(pg)
         # Test collectors use mocked HTTP or local fixture servers.
         print("Running all Python tests, including database and bridge checks...", flush=True)
         run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=ROOT, env=env)

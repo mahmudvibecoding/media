@@ -1,0 +1,10 @@
+# Optional Linux profile for large proxy sweeps; the database stays on loopback.
+services:
+  db:
+    ports:
+      - "127.0.0.1:${MEDIA_DB_HOST_PORT:-55432}:5432"
+  proxy-service:
+    network_mode: host
+    environment:
+      PGHOST: 127.0.0.1
+      PGPORT: ${MEDIA_DB_HOST_PORT:-55432}

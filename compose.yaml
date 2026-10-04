@@ -19,6 +19,7 @@ x-backend: &backend
 services:
   db:
     image: postgres:18.6-bookworm
+    command: ["postgres", "-c", "shared_buffers=${MEDIA_DB_SHARED_BUFFERS:-128MB}", "-c", "max_wal_size=${MEDIA_DB_MAX_WAL_SIZE:-4GB}", "-c", "checkpoint_timeout=15min"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
@@ -35,13 +36,59 @@ services:
       retries: 30
       start_period: 10s
 
-  init:
-    <<: *backend
-    command: ["python", "manage.py", "migrate"]
+  staging-init:
+    image: postgres:18.6-bookworm
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Run sh scripts/setup.sh first}
+    command: ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-d", "postgres", "-f", "/setup/ensure-staging.sql"]
+    volumes:
+      - ./docker/ensure-staging.sql:/setup/ensure-staging.sql:ro
     depends_on:
       db:
         condition: service_healthy
     restart: "no"
+
+  init:
+    <<: *backend
+    command: ["python", "manage.py", "migrate"]
+    depends_on:
+      staging-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  proxy-service:
+    <<: *backend
+    command: ["python", "proxy_service.py", "run"]
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: media
+      PGPASSWORD: ${MEDIA_DB_PASSWORD:?Run sh scripts/setup.sh first}
+      MEDIA_STATE_DIR: /var/lib/media/state
+      MEDIA_OUTPUT_DIR: /var/lib/media/outputs
+      MEDIA_PROXY_BRIDGE_BINARY: /usr/local/bin/proxy-tester
+      MEDIA_PROXY_SERVICE_ENABLED: ${MEDIA_PROXY_SERVICE_ENABLED:-1}
+      MEDIA_PROXY_REPOSITORY: ${MEDIA_PROXY_REPOSITORY:-mahmudvibecoding/proxy-catalog}
+      MEDIA_PROXY_SYNC_INTERVAL: ${MEDIA_PROXY_SYNC_INTERVAL:-3600}
+      MEDIA_PROXY_RETEST_INTERVAL: ${MEDIA_PROXY_RETEST_INTERVAL:-21600}
+      MEDIA_PROXY_TEST_BATCH_SIZE: ${MEDIA_PROXY_TEST_BATCH_SIZE:-0}
+      MEDIA_PROXY_TEST_CONCURRENCY: ${MEDIA_PROXY_TEST_CONCURRENCY:-0}
+      MEDIA_PROXY_JOURNAL_RETENTION: ${MEDIA_PROXY_JOURNAL_RETENTION:-86400}
+      MEDIA_PROXY_QUALITY_SAMPLE: ${MEDIA_PROXY_QUALITY_SAMPLE:-64}
+      MEDIA_PROXY_QUALITY_CONCURRENCY: ${MEDIA_PROXY_QUALITY_CONCURRENCY:-32}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "python", "proxy_service.py", "health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   backend:
     <<: *backend
