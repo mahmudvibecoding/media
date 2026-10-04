@@ -345,7 +345,6 @@ def merge_snapshot(live, stage, manifest, pointer):
         assignments = sql.SQL(",").join(sql.SQL("{}=excluded.{}").format(sql.Identifier(name), sql.Identifier(name))
                                         for name in list_names if name != "url")
         live.execute(sql.SQL("INSERT INTO public.proxy_lists SELECT * FROM incoming_proxy_lists ON CONFLICT(url) DO UPDATE SET {}").format(assignments))
-        live.execute("INSERT INTO app_meta.proxy_test_state(proxy_id) SELECT proxy_id FROM catalog_new_ids ON CONFLICT DO NOTHING")
         sequence = live.execute("SELECT pg_get_serial_sequence('public.proxies','proxy_id')").fetchone()[0]
         current_value = live.execute(sql.SQL("SELECT last_value FROM {}").format(sql.Identifier(*sequence.split(".")))).fetchone()[0]
         maximum = live.execute("SELECT max(proxy_id) FROM public.proxies").fetchone()[0]

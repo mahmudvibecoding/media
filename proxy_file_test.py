@@ -11,22 +11,16 @@ import uuid
 
 from psycopg import sql
 
-from proxy_service_common import digest, read_json, utcnow, write_json
+from proxy_service_common import digest, utcnow, write_json
 from runtime_config import BRIDGE_BINARY, connect_database
 
 
 def test_catalog(home, settings, stop, status, owner):
     home = Path(home)
     started = time.monotonic()
-    # Reuse committed checks from the old in-flight run once. New runs have no
-    # checkpoint, result journal, or per-check database mutation.
-    previous = read_json(home / "current-refresh.json")
-    if previous:
-        run_id, maximum, count = previous["run_id"], previous["max_id"], previous["configurations"]
-    else:
-        run_id = str(uuid.uuid4())
-        maximum, count = owner.execute("SELECT coalesce(max(proxy_id),0),count(*) FROM public.proxies").fetchone()
-    workers = min(settings.test_workers, count) if count else 0
+    run_id = str(uuid.uuid4())
+    maximum, count = owner.execute("SELECT coalesce(max(proxy_id),0),count(*) FROM public.proxies").fetchone()
+    workers = min(settings.test_workers, settings.test_concurrency, count) if count else 0
     offsets = [count*n//workers for n in range(workers+1)] if workers else [0]
     bounds = [0]
     for offset in offsets[1:-1]:
@@ -53,21 +47,17 @@ def test_catalog(home, settings, stop, status, owner):
                 'id',p.proxy_id,'key',encode(p.connection_key,'hex'),'address',p.address,'port',p.port,
                 'protocol',p.connection_settings->>'transport','settings',
                 CASE WHEN jsonb_typeof(p.connection_settings->'options')='string'
-                    THEN (p.connection_settings->>'options')::json ELSE (p.connection_settings->'options')::json END,
-                'checks_done',coalesce(bit_count(r.passes::integer::bit(3)),0),
-                'response_count',coalesce(r.response_count,0),'response_time_ms',coalesce(r.response_time_ms,0),
-                'working_protocol',r.working_protocol,'last_response_at',r.last_response_at,
-                'last_http_status',coalesce(r.last_http_status,0),'tested_at',r.checked_at)
-                FROM public.proxies p LEFT JOIN app_meta.proxy_round_results r
-                  ON r.proxy_id=p.proxy_id AND r.round_id={}
+                    THEN (p.connection_settings->>'options')::json ELSE (p.connection_settings->'options')::json END)
+                FROM public.proxies p
                 WHERE p.proxy_id>={} AND p.proxy_id<{} ORDER BY p.proxy_id)
                 TO STDOUT WITH (FORMAT csv, DELIMITER E'\\x02', QUOTE E'\\x01', ESCAPE E'\\x01')""").format(
-                    sql.Literal(run_id),sql.Literal(bounds[index]),sql.Literal(bounds[index+1]))
+                    sql.Literal(bounds[index]),sql.Literal(bounds[index+1]))
             with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   env=environment, start_new_session=True) as process:
                 processes.append(process)
                 try:
                     with connect_database("proxy", autocommit=True) as conn, conn.transaction():
+                        conn.execute("SET TRANSACTION READ ONLY")
                         conn.execute("SET LOCAL work_mem='512MB'")
                         conn.execute("SET LOCAL jit=off")
                         with conn.cursor().copy(query) as source:
@@ -83,7 +73,10 @@ def test_catalog(home, settings, stop, status, owner):
                     return json.loads(summary)
                 except BaseException:
                     if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGTERM)
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
                         try:
                             process.wait(timeout=20)
                         except subprocess.TimeoutExpired:
@@ -107,11 +100,13 @@ def test_catalog(home, settings, stop, status, owner):
                 stop.set()
                 for process in processes:
                     if process.poll() is None:
-                        os.killpg(process.pid,signal.SIGTERM)
+                        try:
+                            os.killpg(process.pid,signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
                 raise
         performed = sum(r["new_checks"] for r in reports)
-        reused = sum(r["reused_checks"] for r in reports)
-        if sum(r["configurations"] for r in reports) != count or performed+reused != 3*count:
+        if sum(r["configurations"] for r in reports) != count or performed != 3*count:
             raise RuntimeError("The test did not cover the complete catalog")
         rows = []
         for part in folder.glob("working-*.jsonl"):
@@ -135,12 +130,10 @@ def test_catalog(home, settings, stop, status, owner):
         write_json(home/"pool-status.json",pool)
         response_count = sum(r["responses"] for r in reports)
         result = {"run_id":run_id,"configurations":count,"passes_completed":3,"observations":3*count,
-                  "new_checks":performed,"reused_checks":reused,"pool":pool,"checkpoints":False,
-                  "scores":{str(n):sum(r["score"]==n for r in rows) for n in (3,2,1)},
+                  "new_checks":performed,"pool":pool,"checkpoints":False,
+                  "scores":{str(n):sum(r["score"]==n for r in rows) for n in (3,2,1)} | {"0":count-len(rows)},
                   "responses":response_count,"average_response_ms":(
                       sum(r["response_time_ms"] for r in reports)/response_count if response_count else None),
                   "completed_at":utcnow().isoformat(),"seconds":round(time.monotonic()-started,2)}
         write_json(home/"last-refresh.json",result)
-        if previous:
-            (home/"current-refresh.json").unlink()
         return result

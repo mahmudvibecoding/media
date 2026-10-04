@@ -60,8 +60,8 @@ services:
 
   proxy-service:
     <<: *backend
-    profiles: ["automatic"]
-    command: ["python", "proxy_service.py", "run"]
+    profiles: ["tools"]
+    command: ["python", "proxy_service.py", "refresh"]
     environment:
       PGHOST: db
       PGPORT: "5432"
@@ -70,28 +70,14 @@ services:
       MEDIA_STATE_DIR: /var/lib/media/state
       MEDIA_OUTPUT_DIR: /var/lib/media/outputs
       MEDIA_PROXY_BRIDGE_BINARY: /usr/local/bin/proxy-tester
-      MEDIA_PROXY_SERVICE_ENABLED: ${MEDIA_PROXY_SERVICE_ENABLED:-0}
       MEDIA_PROXY_REPOSITORY: ${MEDIA_PROXY_REPOSITORY:-mahmudvibecoding/proxy-catalog}
-      MEDIA_PROXY_SYNC_INTERVAL: ${MEDIA_PROXY_SYNC_INTERVAL:-3600}
-      MEDIA_PROXY_RETEST_INTERVAL: ${MEDIA_PROXY_RETEST_INTERVAL:-21600}
-      MEDIA_PROXY_TEST_BATCH_SIZE: ${MEDIA_PROXY_TEST_BATCH_SIZE:-0}
       MEDIA_PROXY_TEST_CONCURRENCY: ${MEDIA_PROXY_TEST_CONCURRENCY:-0}
-      MEDIA_PROXY_IMPORT_WORKERS: ${MEDIA_PROXY_IMPORT_WORKERS:-0}
       MEDIA_PROXY_TEST_WORKERS: ${MEDIA_PROXY_TEST_WORKERS:-0}
-      MEDIA_PROXY_JOURNAL_RETENTION: ${MEDIA_PROXY_JOURNAL_RETENTION:-86400}
-      MEDIA_PROXY_QUALITY_SAMPLE: ${MEDIA_PROXY_QUALITY_SAMPLE:-64}
-      MEDIA_PROXY_QUALITY_CONCURRENCY: ${MEDIA_PROXY_QUALITY_CONCURRENCY:-32}
     depends_on:
       init:
         condition: service_completed_successfully
-    restart: unless-stopped
-    stop_grace_period: 60s
-    healthcheck:
-      test: ["CMD", "python", "proxy_service.py", "health"]
-      interval: 30s
-      timeout: 10s
-      start_period: 30s
-      retries: 3
+    restart: "no"
+    stop_grace_period: 30s
 
   backend:
     <<: *backend

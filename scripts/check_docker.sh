@@ -8,8 +8,6 @@ docker info >/dev/null
 report_dir=$(mktemp -d "${TMPDIR:-/tmp}/media-docker-check.XXXXXXXX")
 COMPOSE_PROJECT_NAME=$(basename "$report_dir" | tr '[:upper:].' '[:lower:]-')
 export COMPOSE_PROJECT_NAME
-export MEDIA_PROXY_SERVICE_ENABLED=0
-export COMPOSE_PROFILES=automatic
 credentials="$report_dir/credentials.env"
 printf 'POSTGRES_PASSWORD=%s\nMEDIA_DB_PASSWORD=%s\n' \
   "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
@@ -33,7 +31,6 @@ if ! compose up -d --build > "$report_dir/setup.log" 2>&1; then
   exit 1
 fi
 compose run --rm backend python manage.py status
-compose exec -T proxy-service python manage.py status
 # This optional read-only role is used by the permission regression test.
 compose exec -T db psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -c 'CREATE ROLE media_viewer NOLOGIN; GRANT media_viewer TO media; ALTER ROLE media CREATEDB;'

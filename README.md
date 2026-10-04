@@ -67,8 +67,7 @@ zero selects automatic sizing. The total concurrency is shared across workers.
 A local resource error fails the run without publishing incomplete scores.
 
 The command runs once and exits. It uses the existing catalog; importing a newer
-catalog is a separate explicit `proxy_service.py sync` operation. The background
-worker remains disabled.
+catalog is a separate explicit `proxy_service.py sync` operation.
 
 The score is the **number of verified YouTube responses in the latest completed
 set of three checks**: 3 ranks above 2, then 1. Any HTTP response counts, including
@@ -83,10 +82,6 @@ new set keeps the previous completed score until all three checks finish. Old
 history, failure streaks, data quality, and age do not affect ranking or expire a
 completed result. Before a proxy completes its first set of three checks it has
 no score and is absent from the pool.
-
-Results are stored in the ranked file. Existing database statistics remain as
-historical records. A one-time transition from an unfinished older run can reuse
-its already committed checks; new runs create no checkpoints.
 
 The ranked IDs and statistics are saved at
 `/var/lib/media/state/proxy-service/ranked-proxies.jsonl` in the shared state
@@ -105,9 +100,7 @@ host network and PostgreSQL binds to `127.0.0.1:55432`. Set `MEDIA_DB_HOST_PORT`
 that port is already used. Database memory and WAL settings can be adjusted with
 `MEDIA_DB_SHARED_BUFFERS` and `MEDIA_DB_MAX_WAL_SIZE`.
 
-The catalog publisher remains independent. The legacy background worker is
-available only through the explicit `automatic` Compose profile and is disabled
-by default; the manual command does not enable it.
+The catalog publisher remains independent.
 
 The [earlier deployment verification](docs/proxy-service-verification-20261004.json)
 records the concurrency benchmarks and background-service checks before this

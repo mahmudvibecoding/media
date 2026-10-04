@@ -25,7 +25,7 @@ from manage import add_channels
 from metadata_bulk import atomic_json, claim, connect_queue, digest, export_events, finish, initialize, queue_status
 from proxy_statistics import AttemptOutcome
 from proxy_formats import Proxy, pack_connection_settings
-from proxy_service_common import SERVICE_DIR, read_json, write_json, utcnow
+from proxy_service_common import SERVICE_DIR, read_json
 from psycopg.types.json import Jsonb
 from runtime_config import OUTPUT_DIR, STATE_DIR, connect_database
 from test_collect_video_comments import page as comment_page
@@ -48,10 +48,6 @@ def prepare_manual_proxies():
             conn.execute('''INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
                 VALUES (%s,%s,%s,%s,clock_timestamp())''',
                 (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
-        maximum = conn.execute('SELECT max(proxy_id) FROM public.proxies').fetchone()[0]
-    write_json(SERVICE_DIR/'current-refresh.json', {'run_id':str(uuid.uuid4()), 'started_at':utcnow().isoformat(),
-        'catalog':{'fixture':True}, 'max_id':maximum, 'configurations':2, 'pass':1,
-        'after_id':0, 'observations':0, 'last_batch':None})
 
 
 def verify_manual_proxies():
@@ -62,7 +58,7 @@ def verify_manual_proxies():
     assert report['pool']['scoring'] == 'youtube_responses_last_three'
     with connect_database('proxy') as conn:
         assert conn.execute('SELECT count(*) FROM public.proxy_stats').fetchone()[0] == 0
-        assert conn.execute('SELECT count(*) FROM app_meta.proxy_pool_results').fetchone()[0] == 0
+        assert conn.execute("SELECT to_regclass('app_meta.proxy_pool_results')").fetchone()[0] is None
     assert report['checkpoints'] is False and report['new_checks'] == 6
     assert not list(SERVICE_DIR.glob('proxy-results-*'))
     print(json.dumps({'manual_proxy_command':'passed','configurations':2,'passes':3,'observations':6}))

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"math"
 	"os"
 	"os/signal"
 	"sort"
@@ -15,16 +14,6 @@ import (
 	"syscall"
 	"time"
 )
-
-type scoreInput struct {
-	Candidate
-	ChecksDone   int       `json:"checks_done"`
-	Responses    int       `json:"response_count"`
-	ResponseMS   float64   `json:"response_time_ms"`
-	LastResponse time.Time `json:"last_response_at"`
-	LastHTTP     int       `json:"last_http_status"`
-	TestedAt     time.Time `json:"tested_at"`
-}
 
 type scoredProxy struct {
 	ID           int64     `json:"proxy_id"`
@@ -42,26 +31,24 @@ type scoredProxy struct {
 
 type scoreResult struct {
 	Row        scoredProxy
-	Restored   int
 	Performed  int
 	ResponseMS float64
 	Err        error
 }
 
-func scoreOne(ctx context.Context, input scoreInput, options Options, runID string, check func(context.Context, Candidate, Options) Result) scoreResult {
-	out := scoreResult{Restored: input.ChecksDone, ResponseMS: input.ResponseMS}
-	if input.ID < 1 || len(input.Key) != 64 || input.ChecksDone < 0 || input.ChecksDone > 3 || input.Responses < 0 || input.Responses > input.ChecksDone || input.ResponseMS < 0 || math.IsNaN(input.ResponseMS) || math.IsInf(input.ResponseMS, 0) {
+func scoreOne(ctx context.Context, input Candidate, options Options, runID string, check func(context.Context, Candidate, Options) Result) scoreResult {
+	out := scoreResult{}
+	if input.ID < 1 || len(input.Key) != 64 {
 		out.Err = errors.New("invalid scoring input")
 		return out
 	}
-	out.Row = scoredProxy{ID: input.ID, Key: input.Key, Protocol: input.WorkingProtocol, Score: input.Responses,
-		Checks: 3, LastResponse: input.LastResponse, LastHTTP: input.LastHTTP, TestedAt: input.TestedAt, RunID: runID}
-	for n := input.ChecksDone; n < 3; n++ {
+	out.Row = scoredProxy{ID: input.ID, Key: input.Key, Checks: 3, RunID: runID}
+	for n := 0; n < 3; n++ {
 		if ctx.Err() != nil {
 			out.Err = ctx.Err()
 			return out
 		}
-		result := check(ctx, input.Candidate, options)
+		result := check(ctx, input, options)
 		if ctx.Err() != nil {
 			out.Err = ctx.Err()
 			return out
@@ -111,7 +98,7 @@ func score(args []string) (int, error) {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	jobs := make(chan scoreInput, 4096)
+	jobs := make(chan Candidate, 4096)
 	results := make(chan scoreResult, 4096)
 	inputDone := make(chan error, 1)
 	go func() {
@@ -119,7 +106,7 @@ func score(args []string) (int, error) {
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
-			var input scoreInput
+			var input Candidate
 			if err := json.Unmarshal(scanner.Bytes(), &input); err != nil {
 				inputDone <- errors.New("invalid scoring input JSON")
 				return
@@ -159,7 +146,7 @@ func score(args []string) (int, error) {
 	started := time.Now()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	var completed, performed, restored, responses int64
+	var completed, performed, responses int64
 	var responseMS float64
 	var rows []scoredProxy
 	var runError error
@@ -178,14 +165,13 @@ func score(args []string) (int, error) {
 			}
 			completed++
 			performed += int64(result.Performed)
-			restored += int64(result.Restored)
 			responses += int64(result.Row.Score)
 			responseMS += result.ResponseMS
 			if result.Row.Score > 0 {
 				rows = append(rows, result.Row)
 			}
 		case <-ticker.C:
-			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "proxy_score_progress", "worker": *output, "completed": completed, "new_checks": performed, "reused_checks": restored, "seconds": time.Since(started).Seconds()})
+			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "proxy_score_progress", "worker": *output, "completed": completed, "new_checks": performed, "seconds": time.Since(started).Seconds()})
 		}
 	}
 	if runError != nil {
@@ -197,7 +183,7 @@ func score(args []string) (int, error) {
 	if err := <-inputDone; err != nil {
 		return 1, err
 	}
-	if completed != *expected || performed+restored != 3*completed {
+	if completed != *expected || performed != 3*completed {
 		return 1, errors.New("scoring coverage does not match the catalog")
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -233,5 +219,5 @@ func score(args []string) (int, error) {
 	if closeErr != nil {
 		return 1, closeErr
 	}
-	return 0, json.NewEncoder(os.Stdout).Encode(map[string]any{"configurations": completed, "new_checks": performed, "reused_checks": restored, "responses": responses, "response_time_ms": responseMS, "working": len(rows), "seconds": time.Since(started).Seconds()})
+	return 0, json.NewEncoder(os.Stdout).Encode(map[string]any{"configurations": completed, "new_checks": performed, "responses": responses, "response_time_ms": responseMS, "working": len(rows), "seconds": time.Since(started).Seconds()})
 }
