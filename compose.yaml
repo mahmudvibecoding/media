@@ -101,6 +101,20 @@ services:
         soft: 1048576
         hard: 1048576
 
+  metadata:
+    <<: *backend
+    profiles: ["tools"]
+    command: ["python", "collect_metadata_all.py"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: "no"
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
 volumes:
   database:
   collector-state:

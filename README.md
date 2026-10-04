@@ -98,6 +98,50 @@ Use `--channel-id CHANNEL_ID`, repeated as needed, to retry selected saved chann
 Listings containing only a continuation link are followed before the scan can
 finish; repeated tokens still fail the scan without saving partial IDs.
 
+### Collect metadata with ranked proxies and batch saving
+
+After discovery, run:
+
+```sh
+ssh root@198.163.196.164 /opt/media-app/scripts/collect-metadata.sh
+```
+
+The command selects fresh pending records (`metadata_updated_at` and
+`metadata_error` both NULL), loads their IDs once, and saves a verified input
+list. It collects titles, descriptions, durations, thumbnail URLs, and exact
+publication timestamps when available. Field completeness is reported separately
+from successful saves. Validation uses the same metadata response.
+
+Workers reuse ranked proxy connections, allow one active request per proxy, and
+prefer usable metadata per second. Each ID gets up to three attempts through
+available proxies, followed by one recovery pass of up to three attempts.
+Explicit availability errors require matching responses from two different
+proxies. Availability errors are neutral for proxy scoring; request failures
+include their duration in the score.
+
+One writer uses `COPY` and batched updates, targeting 5,000 results or one second.
+Successful metadata and its timestamp commit together. Missing fields preserve
+existing values; final failures update `metadata_error`. The existing database
+metadata lock prevents overlapping collectors. Concurrency is tuned using
+committed records per second and the writer's queue.
+
+An interrupted run resumes automatically from its saved input on the next plain
+invocation. Already committed successes are skipped. Completed runs with errors
+produce `unresolved.jsonl`; retry their remaining IDs explicitly with `--resume`.
+Every invocation keeps its own input, manifest, results, saved IDs, and summary.
+
+From the application directory, select an exact discovery export or run a pilot:
+
+```sh
+sh scripts/collect-metadata.sh --input /var/lib/media/outputs/new-video-ids.jsonl --limit 1000
+sh scripts/collect-metadata.sh --resume /var/lib/media/outputs/metadata-RUN
+```
+
+Input and resume paths refer to the shared output volume inside Docker. With no
+selection arguments, the next new run collects fresh pending records. Exit code
+2 means unfinished records or errors remain. New IDs arriving during a run wait
+for the next invocation.
+
 ### Manual proxy testing
 
 From the application directory, run:

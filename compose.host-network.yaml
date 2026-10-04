@@ -13,3 +13,8 @@ services:
     environment:
       PGHOST: 127.0.0.1
       PGPORT: ${MEDIA_DB_HOST_PORT:-55432}
+  metadata:
+    network_mode: host
+    environment:
+      PGHOST: 127.0.0.1
+      PGPORT: ${MEDIA_DB_HOST_PORT:-55432}
