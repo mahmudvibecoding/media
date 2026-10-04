@@ -164,7 +164,9 @@ Both responses must validate before a profile is saved. Each batch commits in
 one transaction; a failure preserves existing profile values and records
 `metadata_error`. Successful profiles set `metadata_updated_at` and clear that
 error. Missing optional fields are null and known empty lists are stored as
-empty arrays. The collector shares a lock with the subscriber-only collector.
+empty arrays. A published empty title stays an empty string. YouTube links that
+omit the scheme use HTTPS; redirects are retained when their targets are not
+absolute web URLs. The collector shares a lock with the subscriber-only collector.
 
 Each run freezes its channel IDs in `input.jsonl` and writes normalized results,
 progress, a final summary, and `unresolved.jsonl` under the shared output volume.

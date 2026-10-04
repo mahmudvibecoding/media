@@ -1,0 +1,512 @@
+{
+  "verified": true,
+  "recorded_at": 1791133197.3779778,
+  "before": {
+    "recorded_at": 1791131672.0488799,
+    "counts": {
+      "channels": 55239,
+      "videos": 2155782,
+      "comments": 27383086
+    },
+    "channel_ids_sha256": "9f37d9b49645e5072dd25e2e7b7c3369c42af023b1fd3211c17765e9eddd75fc",
+    "ranked_sha256": "8a74abcf5d41746a0cd3bf9b58c4b0d6715c9355ec54d767b25f2e6fa3f4db87"
+  },
+  "counts": {
+    "channels": 55239,
+    "videos": 2155782,
+    "comments": 27383086
+  },
+  "implementation_commit": "2a7d5a8ed5c780f2df012c0d8c59468fa7a24e4e",
+  "completed": 55199,
+  "unresolved": 40,
+  "field_coverage": {
+    "title": 55199,
+    "handle": 55198,
+    "description": 55199,
+    "subscriber_count": 55198,
+    "video_count": 55107,
+    "view_count": 55143,
+    "joined_date": 55199,
+    "country": 28630,
+    "avatar_url": 55199,
+    "keywords": 55199,
+    "external_links": 55199
+  },
+  "original_channel_ids_preserved": true,
+  "failed_channels_previous_counts_preserved": true,
+  "unrelated_record_counts_preserved": true,
+  "ranked_proxy_file_unchanged": true,
+  "saved_profiles_match_database": true,
+  "errors": {
+    "ChannelUnavailable: This account has been terminated because we received multiple third-party claims of copyright infringement regarding material the user posted.": 14,
+    "ChannelUnavailable: This account has been terminated for violating YouTube or Google's Terms of Service.": 4,
+    "ChannelUnavailable: This channel does not exist.": 8,
+    "ChannelUnavailable: This account has been terminated for a violation of YouTube's Terms of Service.": 3,
+    "ChannelUnavailable: This channel was removed because it violated our Community Guidelines.": 5,
+    "ChannelUnavailable: This account has been terminated for violating Google's Terms of Service.": 6
+  },
+  "artifacts": [
+    {
+      "directory": "/var/lib/docker/volumes/media-proxy-service-vc2zyqbb_collection-output/_data/channels-retry-20261004",
+      "input_sha256": "f2436541c8f37cf53b11d79acedcd67d258d3b2e294ce6c9a990272d5755926f",
+      "results_sha256": "14e0d8e02a1f5c57bc529e03eca3fa9c334e25edf38705d26e9ba584b3510dd3",
+      "summary_sha256": "4b563bbccc6eb20c6f57e8254b5610d9d82ce6b9410b04863ce07d2cc0a41600"
+    },
+    {
+      "directory": "/var/lib/docker/volumes/media-proxy-service-vc2zyqbb_collection-output/_data/channels-all-20261004",
+      "input_sha256": "ff55cf6423ec4240c123345d56125994cbe9347ffc279b883b5049a29d7ba86b",
+      "results_sha256": "f9801727158c343f77b712fec60a2992a33aa2c0c9f4cf545af13e451182d421",
+      "summary_sha256": "377da548d2547e7ef8eaea3a148208d6b4c8fc9a2f1f2e728846bb129adcde47"
+    },
+    {
+      "directory": "/var/lib/docker/volumes/media-proxy-service-vc2zyqbb_collection-output/_data/channels-final-direct-20261004",
+      "input_sha256": "38895d60634ab8f038abd22757336a65cc31b8eb82bc14c724a0f3afd1c2fdf7",
+      "results_sha256": "977fa2eb246f6dfaf54a468b5724fdf250bcf400b281d48ed6f97bb99b8d3a8a",
+      "summary_sha256": "fd4f9a917d632032f4906c8ea8229573108f891b1a4251eb9d23b0c1873fa624"
+    },
+    {
+      "directory": "/var/lib/docker/volumes/media-proxy-service-vc2zyqbb_collection-output/_data/channels-pilot-retry-20261004",
+      "input_sha256": "1afed4b827b14ddf9ab94d888859cb2b1abc678aad93f4b1c49b647f9246e963",
+      "results_sha256": "ed659ecea2690b74fa066898dbf6fce5cbf35840b6e92f255fd648fc12fab583",
+      "summary_sha256": "7277e3382012a2ddca377b941121f49747d7570b711aae7f9646284f199dab5a"
+    },
+    {
+      "directory": "/var/lib/docker/volumes/media-proxy-service-vc2zyqbb_collection-output/_data/channels-pilot-20261004",
+      "input_sha256": "9fab32feee217f4e6efed33947372ece302e37abbd71a76a9b2c811a27fdc864",
+      "results_sha256": "dbbd699aefd7ed0d6f23f39193cdcde2722cb5c709f28812c439968088afb073",
+      "summary_sha256": "1469998722ba64e25b1f3fcc79ac5e0dc04cfc24519fbe8dc29a0bede2251bed"
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "17042d0b-7cc2-4d8d-9409-b41a2fc0d19a",
+      "started_at": "2026-10-04T16:41:44.466742+00:00",
+      "input_count": 121,
+      "saved": 79,
+      "failed": 42,
+      "processed": 121,
+      "field_coverage": {
+        "title": 79,
+        "handle": 79,
+        "description": 79,
+        "subscriber_count": 79,
+        "video_count": 79,
+        "view_count": 79,
+        "joined_date": 79,
+        "country": 66,
+        "avatar_url": 79,
+        "keywords": 79,
+        "external_links": 79
+      },
+      "errors": {
+        "ChannelUnavailable: This account has been terminated for a violation of YouTube's Terms of Service.": 2,
+        "ChannelUnavailable: This account has been terminated because we received multiple third-party claims of copyright infringement regarding material the user posted.": 11,
+        "ChannelUnavailable: This account has been terminated for violating YouTube or Google's Terms of Service.": 4,
+        "ChannelUnavailable: This channel was removed because it violated our Community Guidelines.": 4,
+        "ProxyError": 5,
+        "ChannelUnavailable: This channel does not exist.": 8,
+        "ChannelUnavailable: This account has been terminated for violating Google's Terms of Service.": 6,
+        "ResponseShapeError: Channel title is missing": 2
+      },
+      "output_directory": "/var/lib/media/outputs/channels-retry-20261004",
+      "writer_batches": 7,
+      "writer_seconds": 0.20500920969061553,
+      "concurrency_changes": [],
+      "initial_concurrency": 128,
+      "peak_concurrency": 128,
+      "ranked_proxies": 21557,
+      "http_requests": 410,
+      "direct_attempts": 121,
+      "direct_errors": 42,
+      "proxy_attempts": 210,
+      "proxy_errors": 210,
+      "direct_successes": 79,
+      "finished_at": "2026-10-04T16:54:19.763036+00:00",
+      "seconds": 24.265,
+      "interrupted": false,
+      "fatal_errors": [],
+      "unprocessed": 0,
+      "database_unresolved": 42,
+      "database_completed": 79,
+      "final_concurrency": 128,
+      "saved_per_second": 3.26
+    },
+    {
+      "run_id": "c5cfca38-4c72-4a7a-aa4a-ea1433d0dd04",
+      "started_at": "2026-10-04T16:41:44.466742+00:00",
+      "input_count": 55039,
+      "saved": 54918,
+      "failed": 121,
+      "processed": 55039,
+      "field_coverage": {
+        "title": 54918,
+        "handle": 54917,
+        "description": 54918,
+        "subscriber_count": 54917,
+        "video_count": 54828,
+        "view_count": 54863,
+        "joined_date": 54918,
+        "country": 28459,
+        "avatar_url": 54918,
+        "keywords": 54918,
+        "external_links": 54918
+      },
+      "errors": {
+        "ProxyError": 20,
+        "ChannelUnavailable: This account has been terminated for violating Google's Terms of Service.": 5,
+        "ChannelUnavailable: This channel was removed because it violated our Community Guidelines.": 4,
+        "ChannelUnavailable: This account has been terminated because we received multiple third-party claims of copyright infringement regarding material the user posted.": 11,
+        "ResponseShapeError: Unrecognized external link": 65,
+        "ChannelUnavailable: This account has been terminated for violating YouTube or Google's Terms of Service.": 3,
+        "ChannelUnavailable: This account has been terminated for a violation of YouTube's Terms of Service.": 2,
+        "ChannelUnavailable: This channel does not exist.": 6,
+        "ResponseShapeError: Channel title is missing": 1,
+        "ConnectError": 2,
+        "ConnectTimeout": 2
+      },
+      "output_directory": "/var/lib/media/outputs/channels-all-20261004",
+      "writer_batches": 576,
+      "writer_seconds": 45.03464200394228,
+      "concurrency_changes": [
+        {
+          "previous": 128,
+          "concurrency": 256,
+          "useful_pages_per_second": 84.076,
+          "best_concurrency": 128,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 94.483,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 79.853,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 86.251,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 80.661,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 97.681,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 82.375,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 95.721,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 85.687,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 93.604,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 80.182,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 85.515,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 85.718,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 84.484,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 70.23,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 85.371,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 72.358,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 81.451,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 84.197,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        },
+        {
+          "previous": 256,
+          "concurrency": 512,
+          "useful_pages_per_second": 95.604,
+          "best_concurrency": 256,
+          "reason": "testing_more_concurrency"
+        },
+        {
+          "previous": 512,
+          "concurrency": 256,
+          "useful_pages_per_second": 83.418,
+          "best_concurrency": 256,
+          "reason": "no_sustained_throughput_gain"
+        }
+      ],
+      "initial_concurrency": 128,
+      "peak_concurrency": 512,
+      "ranked_proxies": 21557,
+      "http_requests": 110995,
+      "direct_attempts": 55039,
+      "direct_errors": 128,
+      "proxy_attempts": 612,
+      "proxy_errors": 605,
+      "direct_successes": 54911,
+      "proxy_successes": 7,
+      "finished_at": "2026-10-04T16:52:41.600587+00:00",
+      "seconds": 656.695,
+      "interrupted": false,
+      "fatal_errors": [],
+      "unprocessed": 0,
+      "database_unresolved": 121,
+      "database_completed": 54918,
+      "final_concurrency": 256,
+      "saved_per_second": 83.63
+    },
+    {
+      "run_id": "da4502c5-c08a-4696-8022-ce5747ecd342",
+      "started_at": "2026-10-04T16:41:44.466742+00:00",
+      "input_count": 42,
+      "saved": 2,
+      "failed": 40,
+      "processed": 42,
+      "field_coverage": {
+        "title": 2,
+        "handle": 2,
+        "description": 2,
+        "subscriber_count": 2,
+        "video_count": 2,
+        "view_count": 2,
+        "joined_date": 2,
+        "country": 1,
+        "avatar_url": 2,
+        "keywords": 2,
+        "external_links": 2
+      },
+      "errors": {
+        "ChannelUnavailable: This channel was removed because it violated our Community Guidelines.": 5,
+        "ChannelUnavailable: This account has been terminated for violating YouTube or Google's Terms of Service.": 4,
+        "ChannelUnavailable: This account has been terminated for a violation of YouTube's Terms of Service.": 3,
+        "ChannelUnavailable: This account has been terminated because we received multiple third-party claims of copyright infringement regarding material the user posted.": 14,
+        "ChannelUnavailable: This channel does not exist.": 8,
+        "ChannelUnavailable: This account has been terminated for violating Google's Terms of Service.": 6
+      },
+      "output_directory": "/var/lib/media/outputs/channels-final-direct-20261004",
+      "writer_batches": 2,
+      "writer_seconds": 0.037869981955736876,
+      "concurrency_changes": [],
+      "initial_concurrency": 64,
+      "peak_concurrency": 64,
+      "ranked_proxies": 0,
+      "http_requests": 84,
+      "direct_attempts": 82,
+      "direct_errors": 80,
+      "direct_successes": 2,
+      "finished_at": "2026-10-04T16:58:22.392516+00:00",
+      "seconds": 1.804,
+      "interrupted": false,
+      "fatal_errors": [],
+      "unprocessed": 0,
+      "database_unresolved": 40,
+      "database_completed": 2,
+      "final_concurrency": 64,
+      "saved_per_second": 1.11
+    },
+    {
+      "run_id": "122698ab-bbbb-44c7-aeda-61c48ceda081",
+      "started_at": "2026-10-04T16:36:49.627277+00:00",
+      "input_count": 7,
+      "saved": 7,
+      "failed": 0,
+      "processed": 7,
+      "field_coverage": {
+        "title": 7,
+        "handle": 7,
+        "description": 7,
+        "subscriber_count": 7,
+        "video_count": 7,
+        "view_count": 7,
+        "joined_date": 7,
+        "country": 5,
+        "avatar_url": 7,
+        "keywords": 7,
+        "external_links": 7
+      },
+      "errors": {},
+      "output_directory": "/var/lib/media/outputs/channels-pilot-retry-20261004",
+      "writer_batches": 1,
+      "writer_seconds": 0.06456902879290283,
+      "concurrency_changes": [],
+      "initial_concurrency": 128,
+      "peak_concurrency": 128,
+      "ranked_proxies": 21557,
+      "http_requests": 14,
+      "direct_attempts": 7,
+      "direct_successes": 7,
+      "finished_at": "2026-10-04T16:41:11.386191+00:00",
+      "seconds": 4.484,
+      "interrupted": false,
+      "fatal_errors": [],
+      "unprocessed": 0,
+      "database_unresolved": 0,
+      "database_completed": 7,
+      "final_concurrency": 128,
+      "saved_per_second": 1.56
+    },
+    {
+      "run_id": "fff4e97a-831a-4f1a-9d9e-a0cfb6f4fece",
+      "started_at": "2026-10-04T16:36:49.627277+00:00",
+      "input_count": 200,
+      "saved": 193,
+      "failed": 7,
+      "processed": 200,
+      "field_coverage": {
+        "title": 193,
+        "handle": 193,
+        "description": 193,
+        "subscriber_count": 193,
+        "video_count": 191,
+        "view_count": 192,
+        "joined_date": 193,
+        "country": 99,
+        "avatar_url": 193,
+        "keywords": 193,
+        "external_links": 193
+      },
+      "errors": {
+        "ConnectError": 1,
+        "ResponseShapeError: Unrecognized external link": 6
+      },
+      "output_directory": "/var/lib/media/outputs/channels-pilot-20261004",
+      "writer_batches": 8,
+      "writer_seconds": 0.47833907906897366,
+      "concurrency_changes": [],
+      "initial_concurrency": 128,
+      "peak_concurrency": 128,
+      "ranked_proxies": 21557,
+      "http_requests": 466,
+      "direct_attempts": 200,
+      "direct_successes": 193,
+      "direct_errors": 7,
+      "proxy_attempts": 35,
+      "proxy_errors": 35,
+      "finished_at": "2026-10-04T16:37:05.724452+00:00",
+      "seconds": 16.082,
+      "interrupted": false,
+      "fatal_errors": [],
+      "unprocessed": 0,
+      "database_unresolved": 7,
+      "database_completed": 193,
+      "final_concurrency": 128,
+      "saved_per_second": 12.0
+    }
+  ],
+  "verified_at_utc": "2026-10-04T16:59:57.377978+00:00",
+  "selected_channel_count": 55239,
+  "retryable_errors_remaining": 0,
+  "tests": [
+    {
+      "scope": "Full isolated Docker suite",
+      "implementation_commit": "4b82c76",
+      "passed": 440,
+      "skipped": 0,
+      "seconds": 73.79,
+      "fixture_collection": "passed",
+      "import_replay": "passed",
+      "restart_storage_preservation": "passed",
+      "report_directory": "/tmp/media-docker-check.TnqrP6Hm"
+    },
+    {
+      "scope": "Final channel parser, HTTP requests, database writes, and resume tests",
+      "implementation_commit": "2a7d5a8",
+      "passed": 15,
+      "skipped": 0,
+      "seconds": 1.151,
+      "isolated_postgresql": true,
+      "report_directory": "/tmp/media-docker-check.kpDwXMzu"
+    }
+  ],
+  "notes": [
+    "All 55,239 selected channels were processed. The 40 unresolved channels returned explicit YouTube removal, termination, or nonexistent-channel alerts on the final direct check.",
+    "Every saved profile was compared with its normalized result record, including every field and the database completion timestamp.",
+    "Subscriber counts can be rounded. Optional fields that YouTube does not publish remain null. Two channels publish empty titles, which are stored as empty strings.",
+    "YouTube links without a scheme are normalized to HTTPS. Redirects with non-absolute destinations retain the original YouTube redirect URL.",
+    "The main pass took 656.695 seconds. This excludes pilots, retry passes, code fixes, and validation.",
+    "The previously stopped proxy source refresh remained stopped; the ranked proxy file hash did not change."
+  ],
+  "audit_directory": "/opt/media-audits/channel-info-20261004",
+  "unavailable_channel_list": "/opt/media-audits/channel-info-20261004/unresolved.jsonl"
+}
