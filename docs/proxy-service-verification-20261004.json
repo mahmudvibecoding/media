@@ -46,7 +46,14 @@
       "run_before_and_after": "51741818-a045-4bed-9d73-aafecd2b6867",
       "concurrency_before_and_after": 80000
     },
-    "first_data_score_after_reachability": "Regression test passed; saved live metadata observations imported after the fix."
+    "first_data_score_after_reachability": "Regression test passed; saved live metadata observations imported after the fix.",
+    "live_million_result_import": {
+      "run_id": "51741818-a045-4bed-9d73-aafecd2b6867",
+      "observations": 1000000,
+      "committed_receipts": 1,
+      "import_seconds": 170.69,
+      "note": "Import includes journal validation and database updates. The batch resumed across the restart verification."
+    }
   },
   "deployment": {
     "catalog_configurations": 6566643,
@@ -61,6 +68,12 @@
     },
     "initial_import_note": "First import used the earlier database settings and overlapped verification workloads; this is an observed duration, not a tuned throughput benchmark.",
     "working_pool_rule": "Any verified YouTube HTTP response qualifies. Repeated usable data retrieval improves ranking.",
-    "full_catalog_sweep": "running"
+    "full_catalog_sweep": "running",
+    "snapshot_after_first_batch": {
+      "at_utc": "2026-10-04T08:56:31Z",
+      "unique_configurations_tested": 1080355,
+      "recent_youtube_responders": 9961,
+      "ranked_entries_exported": 4096
+    }
   }
 }
