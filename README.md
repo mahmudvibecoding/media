@@ -64,7 +64,8 @@ An interrupted run must be started again.
 Concurrency and worker count are sized from CPU and memory. Set
 `MEDIA_PROXY_TEST_CONCURRENCY` or `MEDIA_PROXY_TEST_WORKERS` to override them;
 zero selects automatic sizing. The total concurrency is shared across workers.
-A local resource error fails the run without publishing incomplete scores.
+Temporary local port exhaustion is retried without counting it as a proxy
+failure. Persistent resource errors stop the run without publishing scores.
 
 The command runs once and exits. It uses the existing catalog; importing a newer
 catalog is a separate explicit `proxy_service.py sync` operation.
@@ -101,9 +102,12 @@ that port is already used. Database memory and WAL settings can be adjusted with
 `MEDIA_DB_SHARED_BUFFERS` and `MEDIA_DB_MAX_WAL_SIZE`.
 
 Large Linux sweeps also need enough connection-tracking capacity. The 52-core
-server uses `net.netfilter.nf_conntrack_max=8388608`; its former 262144 limit
-dropped packets during the sweep. Size this host setting for the server's memory
-and check kernel logs for dropped packets before trusting a test run.
+server uses `net.netfilter.nf_conntrack_max=8388608` with
+`net.netfilter.nf_conntrack_buckets=2097152`; its former 262144-entry limit
+dropped packets during the sweep. The server's ephemeral port range is
+`1024 65535`, and its current test concurrency is 160000 across four processes.
+Size these host settings for the server's memory and check kernel connection
+tracking counters for dropped packets before trusting a test run.
 
 The catalog publisher remains independent.
 

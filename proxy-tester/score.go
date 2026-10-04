@@ -31,10 +31,11 @@ type scoredProxy struct {
 }
 
 type scoreResult struct {
-	Row        scoredProxy
-	Performed  int
-	ResponseMS float64
-	Err        error
+	Row         scoredProxy
+	Performed   int
+	PortRetries int
+	ResponseMS  float64
+	Err         error
 }
 
 func scoreOne(ctx context.Context, input Candidate, options Options, runID string, check func(context.Context, Candidate, Options) Result) scoreResult {
@@ -44,7 +45,7 @@ func scoreOne(ctx context.Context, input Candidate, options Options, runID strin
 		return out
 	}
 	out.Row = scoredProxy{ID: input.ID, Key: input.Key, Checks: 3, RunID: runID}
-	for n := 0; n < 3; n++ {
+	for out.Performed < 3 {
 		if ctx.Err() != nil {
 			out.Err = ctx.Err()
 			return out
@@ -54,11 +55,26 @@ func scoreOne(ctx context.Context, input Candidate, options Options, runID strin
 			out.Err = ctx.Err()
 			return out
 		}
+		retry := false
 		for _, attempt := range result.Attempts {
 			if strings.HasPrefix(attempt.ErrorCode, "local_") {
+				if (attempt.ErrorCode == "local_address_in_use" || attempt.ErrorCode == "local_address_unavailable") && out.PortRetries < 240 {
+					out.PortRetries++
+					select {
+					case <-time.After(250 * time.Millisecond):
+						retry = true
+					case <-ctx.Done():
+						out.Err = ctx.Err()
+						return out
+					}
+					break
+				}
 				out.Err = fmt.Errorf("local resource overload (%s); no final scores published", attempt.ErrorCode)
 				return out
 			}
+		}
+		if retry {
+			continue
 		}
 		out.Performed++
 		out.Row.TestedAt = result.TestedAt
@@ -147,7 +163,7 @@ func score(args []string) (int, error) {
 	started := time.Now()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	var completed, performed, responses int64
+	var completed, performed, responses, portRetries int64
 	var responseMS float64
 	var rows []scoredProxy
 	var runError error
@@ -168,13 +184,14 @@ func score(args []string) (int, error) {
 			}
 			completed++
 			performed += int64(result.Performed)
+			portRetries += int64(result.PortRetries)
 			responses += int64(result.Row.Score)
 			responseMS += result.ResponseMS
 			if result.Row.Score > 0 {
 				rows = append(rows, result.Row)
 			}
 		case <-ticker.C:
-			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "proxy_score_progress", "worker": *output, "completed": completed, "new_checks": performed, "seconds": time.Since(started).Seconds()})
+			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"event": "proxy_score_progress", "worker": *output, "completed": completed, "new_checks": performed, "port_retries": portRetries, "seconds": time.Since(started).Seconds()})
 		}
 	}
 	if runError != nil {
@@ -222,5 +239,5 @@ func score(args []string) (int, error) {
 	if closeErr != nil {
 		return 1, closeErr
 	}
-	return 0, json.NewEncoder(os.Stdout).Encode(map[string]any{"configurations": completed, "new_checks": performed, "responses": responses, "response_time_ms": responseMS, "working": len(rows), "seconds": time.Since(started).Seconds()})
+	return 0, json.NewEncoder(os.Stdout).Encode(map[string]any{"configurations": completed, "new_checks": performed, "responses": responses, "response_time_ms": responseMS, "port_retries": portRetries, "working": len(rows), "seconds": time.Since(started).Seconds()})
 }

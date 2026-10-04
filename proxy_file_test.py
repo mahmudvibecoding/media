@@ -137,6 +137,7 @@ def test_catalog(home, settings, stop, status, owner):
         response_count = sum(r["responses"] for r in reports)
         result = {"run_id":run_id,"configurations":count,"passes_completed":3,"observations":3*count,
                   "new_checks":performed,"pool":pool,"checkpoints":False,
+                  "port_retries":sum(r.get("port_retries",0) for r in reports),
                   "scores":{str(n):sum(r["score"]==n for r in rows) for n in (3,2,1)} | {"0":count-len(rows)},
                   "responses":response_count,"average_response_ms":(
                       sum(r["response_time_ms"] for r in reports)/response_count if response_count else None),
