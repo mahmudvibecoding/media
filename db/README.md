@@ -4,7 +4,10 @@
 - YouTube tables: `public.channels`, `public.videos`, `public.comments`
 - Proxy database: `proxy`
 - Proxy tables: `public.proxies`, `public.proxy_stats`, `public.proxy_lists`
-- Channels: `channel_id TEXT PRIMARY KEY`, nullable `subscriber_count BIGINT`
+- Channels: `channel_id TEXT PRIMARY KEY`, nullable `subscriber_count BIGINT`,
+  profile fields (`title`, `handle`, `description`, `video_count`, `view_count`,
+  `joined_date`, `country`, `avatar_url`, `keywords`, `external_links`), and
+  `metadata_updated_at` / `metadata_error`. Migration 012 adds the profile fields.
 - Last documented channel count: 55,239 (620 removed after the initial import)
 - Seed: `data/channels.csv` (55,859 channel IDs)
 - Runtime: Homebrew PostgreSQL 18.6

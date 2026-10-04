@@ -142,6 +142,44 @@ selection arguments, the next new run collects fresh pending records. Exit code
 2 means unfinished records or errors remain. New IDs arriving during a run wait
 for the next invocation.
 
+### Collect channel profiles
+
+```sh
+sh scripts/collect-channels.sh
+```
+
+The command collects all saved channels whose `metadata_updated_at` is empty.
+Each channel uses the internal WEB `browse` endpoint for its overview, followed
+by the About continuation returned in that response. It stores title, handle,
+description, subscriber/video/view counts, joined date, country, avatar URL,
+keywords, and public external links. Subscriber counts can be rounded. Country
+is the value displayed by the channel; joined dates have date precision.
+
+Direct requests are preferred, with the existing ranked proxy file used for
+retries and additional concurrency. The command tunes concurrency using saved
+profiles per second. A direct HTTP 403/429 pauses that route and reduces its
+concurrency. No proxy catalog refresh is started by this command.
+
+Both responses must validate before a profile is saved. Each batch commits in
+one transaction; a failure preserves existing profile values and records
+`metadata_error`. Successful profiles set `metadata_updated_at` and clear that
+error. Missing optional fields are null and known empty lists are stored as
+empty arrays. The collector shares a lock with the subscriber-only collector.
+
+Each run freezes its channel IDs in `input.jsonl` and writes normalized results,
+progress, a final summary, and `unresolved.jsonl` under the shared output volume.
+An interrupted run resumes automatically. `--resume RUN_DIRECTORY` retries the
+unfinished IDs from a particular run, `--refresh` selects all channels including
+previously completed ones, and `--limit 200` runs a pilot. Exit code 2 means some
+selected channels remain unresolved.
+
+Use `--transport direct` or `--transport proxy` to choose one route. Automatic
+concurrency is the default; `--concurrency N` fixes it and `--max-concurrency N`
+sets the maximum. Each pass allows three attempts, followed by one recovery
+pass for unresolved channels. `--timeout`, `--batch-size`, and
+`--direct-concurrency` control request deadlines, commit size, and simultaneous
+direct requests.
+
 ### Refresh sources and test every proxy
 
 From the application directory, run:

@@ -1,7 +1,22 @@
 CREATE TABLE public.channels (
     channel_id TEXT PRIMARY KEY,
-    subscriber_count BIGINT CHECK (subscriber_count >= 0)
+    subscriber_count BIGINT CHECK (subscriber_count >= 0),
+    title TEXT,
+    handle TEXT,
+    description TEXT,
+    video_count BIGINT CHECK (video_count >= 0),
+    view_count BIGINT CHECK (view_count >= 0),
+    joined_date DATE,
+    country TEXT,
+    avatar_url TEXT,
+    keywords TEXT[],
+    external_links JSONB CHECK (jsonb_typeof(external_links) = 'array'),
+    metadata_updated_at TIMESTAMPTZ,
+    metadata_error TEXT
 );
+
+CREATE INDEX channels_metadata_pending_idx ON public.channels(channel_id)
+    WHERE metadata_updated_at IS NULL;
 
 CREATE TABLE public.videos (
     video_id TEXT PRIMARY KEY,
