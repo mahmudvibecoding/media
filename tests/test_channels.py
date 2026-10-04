@@ -92,6 +92,14 @@ class ParseTests(unittest.TestCase):
                 result=parse_about(payload,CHANNEL,parse_overview(overview(),CHANNEL))
                 self.assertEqual(result['external_links'],[{'title':None,'url':'https://'+url}])
 
+    def test_unnamed_channels_keep_their_empty_public_title(self):
+        first=overview()
+        first['metadata']['channelMetadataRenderer']['title']=''
+        self.assertEqual(parse_about(about(),CHANNEL,parse_overview(first,CHANNEL))['title'],'')
+        first['metadata']['channelMetadataRenderer'].pop('title')
+        with self.assertRaises(ResponseShapeError):
+            parse_overview(first,CHANNEL)
+
     def test_wrong_ids_missing_about_and_malformed_links_are_rejected(self):
         with self.assertRaises(ResponseShapeError):
             parse_overview(overview('other'),CHANNEL)
@@ -192,6 +200,11 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.conn.execute('SELECT '+columns+' FROM channels WHERE channel_id=%s',(self.ids[0],)).fetchone(),before)
         self.assertEqual(self.conn.execute('SELECT subscriber_count,metadata_updated_at,metadata_error FROM channels WHERE channel_id=%s',
             (self.ids[1],)).fetchone(),(99,None,'HTTP 503'))
+        unnamed=final(self.ids[2])
+        unnamed['metadata']['title']=''
+        self.writer.write([unnamed])
+        self.assertEqual(self.conn.execute('SELECT title,subscriber_count,metadata_updated_at IS NOT NULL FROM channels WHERE channel_id=%s',
+            (self.ids[2],)).fetchone(),('',12300,True))
 
     def test_missing_channel_rolls_back_the_whole_batch(self):
         with self.assertRaises(ValueError):

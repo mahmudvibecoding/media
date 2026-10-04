@@ -107,7 +107,7 @@ def parse_overview(payload, channel_id):
         raise ResponseShapeError('Channel metadata is missing')
     if metadata.get('externalId') != channel_id:
         raise ResponseShapeError('Channel ID does not match the request')
-    if not isinstance(metadata.get('title'), str) or not metadata['title'].strip():
+    if not isinstance(metadata.get('title'), str):
         raise ResponseShapeError('Channel title is missing')
     microformat = payload.get('microformat', {}).get('microformatDataRenderer', {})
     keywords = microformat.get('tags')

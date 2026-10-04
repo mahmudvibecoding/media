@@ -64,7 +64,7 @@ class ChannelWriter:
         for row in results:
             good = row['status'] == 'ok'
             profile = row.get('metadata') or {}
-            if good and (not profile.get('title') or set(profile) != set(FIELDS)):
+            if good and (not isinstance(profile.get('title'), str) or set(profile) != set(FIELDS)):
                 raise ValueError('Incomplete normalized channel profile')
             fields = [profile.get(name) if good else None for name in FIELDS]
             if fields[6] is not None:
@@ -87,4 +87,3 @@ class ChannelWriter:
                 FROM channel_incoming i WHERE c.channel_id=i.channel_id AND i.successful''').format(assignments))
             self.conn.execute('''UPDATE public.channels c SET metadata_error=i.error
                 FROM channel_incoming i WHERE c.channel_id=i.channel_id AND NOT i.successful''')
-
