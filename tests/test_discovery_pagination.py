@@ -115,6 +115,22 @@ class ContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'],'pagination_loop')
         self.assertEqual(result['videos_inserted'],0)
 
+    async def test_distinct_empty_pages_can_advance_between_video_pages(self):
+        responses = {None:first_page([], 'first-cards'),
+                     'first-cards':next_page(['RtXBV0X1v1Q'], 'empty-gap'),
+                     'empty-gap':next_page([], 'older-cards'),
+                     'older-cards':next_page(['JMsuT0cvMFc'])}
+        requested = []
+        def respond(request):
+            token = json.loads(request.content).get('continuation')
+            requested.append(token)
+            return httpx.Response(200,json=responses[token])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            result = await scan_tab(client,None,'channel','video',known_ids=set(),persist=False)
+        self.assertEqual(requested,[None,'first-cards','empty-gap','older-cards'])
+        self.assertTrue(result['scan_complete'])
+        self.assertEqual([v['video_id'] for v in result['videos']],['RtXBV0X1v1Q','JMsuT0cvMFc'])
+
 
 @unittest.skipUnless(os.environ.get("MEDIA_TEST_DATABASE_URL"), "Set MEDIA_TEST_DATABASE_URL for database tests")
 class PaginationDatabaseTests(unittest.IsolatedAsyncioTestCase):

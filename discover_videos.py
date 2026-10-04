@@ -381,11 +381,12 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
                 break
 
             signature = tuple(ids)
-            if page["continuation"] in seen_tokens or signature in seen_pages:
+            if page["continuation"] in seen_tokens or (signature and signature in seen_pages):
                 result.update(status="pagination_loop", error="Pagination repeated a token or page")
                 return result
             seen_tokens.add(page["continuation"])
-            seen_pages.add(signature)
+            if signature:
+                seen_pages.add(signature)
             continuation = page["continuation"]
         else:
             result.update(status="page_limit", error=f"Scan needs more than {max_pages} pages; nothing saved")
