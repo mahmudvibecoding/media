@@ -79,8 +79,10 @@ or one second. It uses `COPY` into a temporary table and one transaction to inse
 each batch, skipping existing IDs. Failed tab scans never become saved stopping
 points. Workers do not query PostgreSQL while fetching pages.
 
-Concurrency starts at 256 and is tuned from measured useful-page throughput;
-the maximum is the size of the ranked pool. The command reports progress and
+Concurrency starts at up to 1,024, scaled to available CPUs, and is tuned from
+measured useful-page throughput. Higher concurrency must improve throughput by
+at least 5%; two windows without that gain return to the best measured level.
+The maximum is the size of the ranked pool. The command reports progress and
 creates `summary.json`, `results.jsonl`, `new-video-ids.jsonl`, and
 `unresolved.jsonl` under the shared output volume. Exit status 2 means errors or
 unprocessed tabs remain. A shared state lock prevents overlapping discovery

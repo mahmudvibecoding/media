@@ -1,6 +1,7 @@
 import asyncio
 from collections import Counter
 import json
+import multiprocessing
 import queue
 import sys
 import tempfile
@@ -41,7 +42,8 @@ def listing(kind='video', ids=(), token=None):
             'chips': [{'chipViewModel': {'text': 'Latest', 'selected': True}}]}}}}}}]}}}
 
 
-def fixture_process(number,count,jobs,known,proxies,ranks,next_job,target,messages,stop,options):
+def fixture_process(number,count,jobs,known,proxies,ranks,next_job,target,messages,stop,options,
+                    progress_slot=None):
     completed = 0
     while True:
         with next_job.get_lock():
@@ -54,7 +56,9 @@ def fixture_process(number,count,jobs,known,proxies,ranks,next_job,target,messag
             status='ok',scan_complete=True,videos=[{'video_id':uuid.uuid4().hex[:11]}],pages_fetched=1,
             videos_inserted=0,videos_already_present=0)))
         completed += 1
-    messages.put(dict(event='progress',worker=number,counts=dict(http_attempts=completed,usable_pages=completed)))
+    with progress_slot.get_lock():
+        progress_slot.get_obj()[:] = [completed if key in ('http_attempts','usable_pages') else 0
+                                     for key in COUNTERS] + [0]
     messages.put(dict(event='worker_done',worker=number))
 
 
@@ -93,7 +97,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         quick.observe(None, 60)
         self.assertEqual(vars(quick), original)
 
-    def test_tuner_requires_sustained_regression_and_ignores_tail(self):
+    def test_tuner_requires_sustained_gain_and_ignores_tail(self):
         tuner = ConcurrencyTuner(256, 4096, interval=10)
         self.assertIsNone(tuner.observe(1, 0, 100000))
         self.assertEqual(tuner.observe(11, 1000, 100000)['concurrency'], 512)
@@ -101,6 +105,16 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(tuner.observe(31, 2300, 100000))
         self.assertEqual(tuner.observe(41, 2400, 100000)['concurrency'], 512)
         self.assertIsNone(tuner.observe(100, 2410, 1))
+
+    def test_tuner_returns_to_lower_concurrency_when_throughput_plateaus(self):
+        tuner = ConcurrencyTuner(1024, 8192, interval=10)
+        tuner.observe(1, 0, 100000)
+        self.assertEqual(tuner.observe(11, 3000, 100000)['concurrency'],2048)
+        self.assertIsNone(tuner.observe(21, 6090, 100000))
+        change = tuner.observe(31, 9150, 100000)
+        self.assertEqual(change['concurrency'],1024)
+        self.assertEqual(change['reason'],'no_sustained_throughput_gain')
+        self.assertIsNone(tuner.observe(41, 12150, 100000))
 
 
 class FakeClients:
@@ -184,6 +198,27 @@ class FetchAndScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(r['recovery'] for r in results),1)
         self.assertEqual(calls['video'],2)
 
+    async def test_progress_stays_current_when_result_queue_is_full(self):
+        options = parser().parse_args([])
+        next_job = SimpleNamespace(value=0, get_lock=lambda: threading.Lock())
+        messages = queue.Queue(maxsize=1)
+        messages.put('occupied')
+        slot = multiprocessing.get_context('spawn').Array('d',len(COUNTERS)+1)
+        clients = FakeClients([lambda _: httpx.Response(200,json=listing())])
+        with patch('discover_all.CatalogClients',return_value=clients):
+            task = asyncio.create_task(run_worker(0,1,[('channel','video')],{},clients.proxies,ranking(1),
+                next_job,SimpleNamespace(value=1),messages,threading.Event(),options,slot))
+            try:
+                async with asyncio.timeout(3):
+                    while slot[COUNTERS.index('usable_pages')] != 1:
+                        await asyncio.sleep(0.05)
+                self.assertFalse(task.done())
+            finally:
+                messages.get_nowait()
+                await asyncio.wait_for(task,3)
+        self.assertEqual(messages.get_nowait()['event'],'result')
+        self.assertEqual(slot[COUNTERS.index('http_attempts')],1)
+
 
 class WriterDatabaseTests(unittest.TestCase):
     def setUp(self):
@@ -246,6 +281,7 @@ class WriterDatabaseTests(unittest.TestCase):
                 self.assertEqual(collect(options),0)
             summary = json.loads((folder/'summary.json').read_text())
             self.assertEqual((summary['tabs_completed'],summary['channels_completed'],summary['videos_inserted']),(2,1,2))
+            self.assertEqual((summary['http_attempts'],summary['usable_pages']),(2,2))
             exported = {json.loads(s)['video_id'] for s in (folder/'new-video-ids.jsonl').read_text().splitlines()}
             saved = {r[0] for r in self.conn.execute('SELECT video_id FROM public.videos WHERE channel_id=%s',(self.channel,))}
             self.assertEqual(exported,saved)

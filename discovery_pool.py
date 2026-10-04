@@ -135,14 +135,14 @@ class ConcurrencyTuner:
             self.current = max(1, min(self.best_limit, self.current//2))
             self.hold_until = now + 2*self.interval
             reason = 'writer_backlog'
-        elif self.best_rate and rate < 0.8*self.best_rate:
+        elif self.current > self.best_limit and rate < 1.05*self.best_rate:
             self.regressions += 1
             if self.regressions < 2:
                 return None
             self.current = self.best_limit
             self.hold_until = now + 2*self.interval
             self.regressions = 0
-            reason = 'useful_page_rate_decreased'
+            reason = 'no_sustained_throughput_gain'
         else:
             self.regressions = 0
             if rate > self.best_rate:

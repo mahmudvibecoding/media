@@ -70,13 +70,18 @@ async def fetch_using_pool(clients, pool, stats, channel, kind, continuation, op
     return page
 
 
-async def run_worker(number, count, jobs, known, proxies, ranks, next_job, target, messages, stop, options):
+async def run_worker(number, count, jobs, known, proxies, ranks, next_job, target, messages, stop, options,
+                     progress_slot=None):
     stats = Counter({key: 0 for key in COUNTERS})
     pool = DiscoveryPool(ranks)
     failed = []
 
-    def progress(event='progress'):
-        message = dict(event=event, worker=number, counts=dict(stats), active=len(pool.active))
+    def progress():
+        if progress_slot is not None:
+            with progress_slot.get_lock():
+                progress_slot.get_obj()[:] = [stats[key] for key in COUNTERS] + [len(pool.active)]
+            return
+        message = dict(event='progress', worker=number, counts=dict(stats), active=len(pool.active))
         try:
             messages.put_nowait(message)
         except queue.Full:
@@ -84,7 +89,7 @@ async def run_worker(number, count, jobs, known, proxies, ranks, next_job, targe
 
     async def report():
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
             progress()
 
     async with CatalogClients(proxies, len(proxies), connect_timeout=options.connect_timeout,
@@ -129,7 +134,7 @@ async def run_worker(number, count, jobs, known, proxies, ranks, next_job, targe
                             stats['recovery_tabs'] += 1
                         pending.add(asyncio.create_task(scan(job, recovery)))
                     if stop.is_set():
-                        exhausted = True
+                        break
                     if not pending:
                         break
                     done, pending = await asyncio.wait(pending, timeout=0.5,
@@ -149,18 +154,20 @@ async def run_worker(number, count, jobs, known, proxies, ranks, next_job, targe
         finally:
             reporter.cancel()
             await asyncio.gather(reporter, return_exceptions=True)
-            await asyncio.to_thread(messages.put,
-                dict(event='progress', worker=number, counts=dict(stats), active=0))
+            progress()
 
 
-def worker_entry(number, count, jobs, known, proxies, ranks, next_job, target, messages, stop, options):
+def worker_entry(number, count, jobs, known, proxies, ranks, next_job, target, messages, stop, options,
+                 progress_slot=None):
+    if sys.platform.startswith('linux'):
+        os.setsid()
     cpus = getattr(os, 'process_cpu_count', os.cpu_count)() or 2
     os.environ.setdefault('GOMAXPROCS', str(max(1, cpus//count-1)))
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     try:
         asyncio.run(run_worker(number, count, jobs, known, proxies, ranks, next_job,
-                               target, messages, stop, options))
+                               target, messages, stop, options, progress_slot))
     except BaseException as exc:
         stop.set()
         messages.put(dict(event='fatal', worker=number, error=type(exc).__name__+': '+str(exc)))
@@ -182,13 +189,14 @@ def collect(options):
     cpus = getattr(os, 'process_cpu_count', os.cpu_count)() or 2
     workers = min(options.workers or max(1, min(8, cpus//4)), len(proxies), max(1, len(jobs)))
     maximum = min(options.max_concurrency or len(proxies), len(proxies))
-    initial = min(options.concurrency or 256, maximum)
+    initial = min(options.concurrency or min(1024, max(64, cpus*32)), maximum)
     workers = min(workers, initial)
     # All database connections are closed before forking. Linux workers share
     # the immutable existing-ID map through copy-on-write memory.
     context = multiprocessing.get_context('fork' if sys.platform.startswith('linux') else 'spawn')
     next_job, target = context.Value('i', 0), context.Value('i', initial)
     messages, stop = context.Queue(maxsize=2048), context.Event()
+    progress_slots = [context.Array('d', len(COUNTERS)+1) for _ in range(workers)]
     processes = []
     previous_handlers = {}
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -201,20 +209,35 @@ def collect(options):
                    tabs_completed=0, tabs_failed=0, videos_inserted=0, writer_batches=0,
                    writer_seconds=0.0, output_directory=str(folder), concurrency_changes=[])
     tuner = ConcurrencyTuner(initial, maximum, options.tune_seconds)
-    counts, observed, done, recorded = {}, Counter(), set(), set()
+    observed, done, recorded = Counter(), set(), set()
     channel_success = Counter()
     pending, pending_rows = [], 0
     fatal, sample_counts = [], Counter()
     last_flush = last_report = time.monotonic()
+    last_totals, cached_totals = 0.0, {}
 
-    def totals():
-        return {name: sum(c.get(name, 0) for c in counts.values()) for name in COUNTERS}
+    def totals(force=False):
+        nonlocal last_totals, cached_totals
+        now = time.monotonic()
+        if force or now-last_totals >= 1:
+            snapshots = []
+            for slot in progress_slots:
+                with slot.get_lock():
+                    snapshots.append(list(slot.get_obj()))
+            cached_totals = {name: sum(row[index] for row in snapshots)
+                             for index, name in enumerate(COUNTERS)}
+            cached_totals = {name: value if name == 'request_seconds' else int(value)
+                             for name, value in cached_totals.items()}
+            cached_totals['active_requests'] = int(sum(row[-1] for row in snapshots))
+            last_totals = now
+        return cached_totals
 
     try:
         for number in range(workers):
             process = context.Process(target=worker_entry,
                 args=(number, workers, jobs, known, proxies[number::workers], ranks[number::workers],
-                      next_job, target, messages, stop, options), name=f'discovery-{number}')
+                      next_job, target, messages, stop, options, progress_slots[number]),
+                name=f'discovery-{number}')
             process.start()
             processes.append(process)
         emit('started', **summary)
@@ -281,8 +304,6 @@ def collect(options):
                             pending_rows += len(result['videos'])
                         else:
                             record(result)
-                    elif event == 'progress':
-                        counts[message['worker']] = message['counts']
                     elif event == 'worker_done':
                         done.add(message['worker'])
                     elif event == 'fatal':
@@ -337,15 +358,21 @@ def collect(options):
         for process in processes:
             process.join(timeout=2)
             if process.is_alive():
-                process.terminate()
+                if sys.platform.startswith('linux') and os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
                 process.join(timeout=3)
             if process.is_alive():
-                process.kill()
+                if sys.platform.startswith('linux') and os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
                 process.join()
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
         elapsed = time.monotonic()-started
-        summary.update(**totals(), seconds=round(elapsed, 3), outcomes=dict(observed),
+        summary.update(**totals(force=True), seconds=round(elapsed, 3), outcomes=dict(observed),
                        channels_completed=sum(n == 2 for n in channel_success.values()),
                        tabs_unprocessed=len(jobs)-len(recorded), fatal_errors=fatal,
                        final_concurrency=target.value, best_measured_concurrency=tuner.best_limit,
