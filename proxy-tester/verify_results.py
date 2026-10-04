@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import psycopg
 from psycopg.rows import dict_row
@@ -15,6 +16,8 @@ from psycopg.types.json import Jsonb
 
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from runtime_config import connect_database
 
 
 def read_json(path):
@@ -78,8 +81,7 @@ def main():
     checks["stability_has_at_most_one_metadata_request_per_configuration"] = multiple_requests == 0
     checks["stability_responses_have_verified_youtube_tls"] = unverified_responses == 0
     checks["stability_journal_response_count"] = sum(encodings.values()) == controller["stability_responses"]
-    with psycopg.connect(dbname="proxy", user="mahmud", host=str(ROOT / ".local/postgres/socket"),
-                         port=5432, connect_timeout=5, row_factory=dict_row) as conn:
+    with connect_database("proxy", connect_timeout=5, row_factory=dict_row) as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         conn.execute("SET LOCAL statement_timeout = '10min'")
         conn.execute("SET LOCAL work_mem = '128MB'")

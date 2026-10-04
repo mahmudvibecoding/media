@@ -1,7 +1,6 @@
 """Verify and import exact view and like counts from immutable result batches."""
 from __future__ import annotations
 
-import argparse
 from datetime import datetime
 import fcntl
 import gzip
@@ -10,15 +9,17 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 import time
 
 import psycopg
 
+from bulk_import_source import parse_import_args, source_status, sync_outbox
+
 from collect_video_stats import has_stats, stats_error_reason, exact_count, MAX_COUNT
 from metadata_bulk_import import read_chunk as read_common_chunk
 from discover_videos import open_database
+from runtime_config import connect_database
 from metadata_bulk import atomic_json, digest, utcnow
 from proxy_statistics import Aggregate, AttemptOutcome, ProxyTarget, StatisticsBatch, write_batch
 from collection_policy import data_observation_matches
@@ -124,80 +125,72 @@ def sync(args):
     (folder / 'outbox').mkdir(exist_ok=True)
     lock = (folder / 'sync.lock').open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    state_path = folder / 'import-status.json'
-    state = json.loads(state_path.read_text()) if state_path.exists() else {
-        'run_id': args.run_id, 'last_seq': 0, 'statistics_saved': 0, 'errors_recorded': 0,
-        'events_imported': 0, 'batches': 0, 'started_at': utcnow()}
-    if state['run_id'] != args.run_id:
-        raise ValueError('Import state belongs to another run')
     media = proxy = None
-    while True:
-        try:
-            if media is None or media.closed:
-                media = open_database(autocommit=True)
-                if not media.execute("SELECT pg_try_advisory_lock(hashtext('media.video-statistics'))").fetchone()[0]:
-                    media.close()
-                    raise RuntimeError('Another statistics collector is running')
-            if proxy is None or proxy.closed:
-                proxy = psycopg.connect(dbname='proxy', user='mahmud', host=str(ROOT / '.local/postgres/socket'),
-                    port=5432, autocommit=True, application_name='bulk-statistics-import')
-            subprocess.run(['rsync', '-a', '--ignore-existing', '--include=*.jsonl.gz',
-                '--include=*.jsonl.gz.json', '--exclude=*', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=10',
-                f'{args.host}:{args.remote}/outbox/', str(folder / 'outbox') + '/'], check=True, timeout=120,
-                stdout=subprocess.DEVNULL)
-            for receipt in sorted((folder / 'outbox').glob('events-*.jsonl.gz.json')):
-                info = json.loads(receipt.read_text())
-                if info['last_seq'] <= state['last_seq']:
-                    continue
-                if info['first_seq'] != state['last_seq'] + 1:
-                    raise ValueError('Result files have a gap; refusing to skip events')
-                path = folder / 'outbox' / info['name']
-                if not path.is_file():
-                    break
-                result = apply_chunk(media, proxy, path, args.run_id)
-                state.update(last_seq=result['last_seq'], updated_at=utcnow(), last_batch=result, error=None)
-                for name in ('statistics_saved', 'errors_recorded'):
-                    state[name] += result[name]
-                state['events_imported'] += result['events']
-                state['batches'] += 1
+    try:
+        state_path = folder / 'import-status.json'
+        state = json.loads(state_path.read_text()) if state_path.exists() else {
+            'run_id': args.run_id, 'last_seq': 0, 'statistics_saved': 0, 'errors_recorded': 0,
+            'events_imported': 0, 'batches': 0, 'started_at': utcnow()}
+        if state['run_id'] != args.run_id:
+            raise ValueError('Import state belongs to another run')
+        while True:
+            try:
+                if media is None or media.closed:
+                    media = open_database(autocommit=True)
+                    if not media.execute("SELECT pg_try_advisory_lock(hashtext('media.video-statistics'))").fetchone()[0]:
+                        media.close()
+                        raise RuntimeError('Another statistics collector is running')
+                if proxy is None or proxy.closed:
+                    proxy = connect_database("proxy", autocommit=True, application_name='bulk-statistics-import')
+                sync_outbox(args, folder)
+                for receipt in sorted((folder / 'outbox').glob('events-*.jsonl.gz.json')):
+                    info = json.loads(receipt.read_text())
+                    if info['last_seq'] <= state['last_seq']:
+                        continue
+                    if info['first_seq'] != state['last_seq'] + 1:
+                        raise ValueError('Result files have a gap; refusing to skip events')
+                    path = folder / 'outbox' / info['name']
+                    if not path.is_file():
+                        break
+                    result = apply_chunk(media, proxy, path, args.run_id)
+                    state.update(last_seq=result['last_seq'], updated_at=utcnow(), last_batch=result, error=None)
+                    for name in ('statistics_saved', 'errors_recorded'):
+                        state[name] += result[name]
+                    state['events_imported'] += result['events']
+                    state['batches'] += 1
+                    atomic_json(state_path, state)
+                    print(json.dumps(result), flush=True)
+                remote = source_status(args, folder)
+                state.update(remote=remote, updated_at=utcnow(), error=None)
+                state['complete'] = (remote['state'] == 'complete'
+                    and remote['exported_seq'] == remote['counters']['events'] == state['last_seq'])
                 atomic_json(state_path, state)
-                print(json.dumps(result), flush=True)
-            command = 'cat ' + shlex.quote(str(Path(args.remote) / 'status.json'))
-            response = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host, command],
-                check=True, timeout=20, text=True, capture_output=True)
-            remote = json.loads(response.stdout)
-            state.update(remote=remote, updated_at=utcnow(), error=None)
-            state['complete'] = (remote['state'] == 'complete'
-                and remote['exported_seq'] == remote['counters']['events'] == state['last_seq'])
-            atomic_json(state_path, state)
-            if state['complete']:
-                print(json.dumps({'complete': True, **state}), flush=True)
-                media.close()
-                proxy.close()
+                if state['complete']:
+                    print(json.dumps({'complete': True, **state}), flush=True)
+                    return
+            except (OSError, subprocess.SubprocessError, psycopg.Error, RuntimeError) as exc:
+                state.update(error=type(exc).__name__, updated_at=utcnow())
+                atomic_json(state_path, state)
+                print(json.dumps({'retrying_import': type(exc).__name__}), flush=True)
+                for conn in (media, proxy):
+                    if conn is not None:
+                        conn.close()
+                media = proxy = None
+            if args.once:
                 return
-        except (OSError, subprocess.SubprocessError, psycopg.Error, RuntimeError) as exc:
-            state.update(error=type(exc).__name__, updated_at=utcnow())
-            atomic_json(state_path, state)
-            print(json.dumps({'retrying_import': type(exc).__name__}), flush=True)
-            for conn in (media, proxy):
-                if conn is not None:
-                    conn.close()
-            media = proxy = None
-        if args.once:
-            return
-        time.sleep(args.interval)
+            time.sleep(args.interval)
+    finally:
+        for conn in (media, proxy):
+            if conn is not None:
+                conn.close()
+        lock.close()
+
 
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--host', required=True)
-    parser.add_argument('--remote', required=True)
-    parser.add_argument('--local', type=Path, required=True)
-    parser.add_argument('--run-id', required=True)
-    parser.add_argument('--interval', type=float, default=5)
-    parser.add_argument('--once', action='store_true')
-    sync(parser.parse_args())
+    sync(parse_import_args(__doc__, 'statistics'))
+
 
 
 if __name__ == '__main__':

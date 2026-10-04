@@ -21,6 +21,7 @@ import psycopg
 from collect_subscribers import CLIENT_VERSION, ROOT, positive_int
 from collection_policy import video_error_reason
 from discover_videos import open_database
+from runtime_config import OUTPUT_DIR
 from proxy_statistics import AttemptOutcome, ProxyStatistics, proxy_connection_error
 from proxy_catalog import CatalogClients, DEFAULT_BRIDGE_BINARY, SUPPORTED_PROTOCOLS, load_catalog
 
@@ -455,7 +456,7 @@ async def collect(args):
         if not conn.execute("SELECT pg_try_advisory_lock(hashtext('media.video-metadata'))").fetchone()[0]:
             raise RuntimeError("Another video metadata collector is running for this database")
         videos = select_videos(conn, args)
-        out = args.output or ROOT / "outputs" / (
+        out = args.output or OUTPUT_DIR / (
             "video-metadata-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         )
         out.mkdir(parents=True, exist_ok=False)

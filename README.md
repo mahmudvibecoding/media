@@ -10,7 +10,107 @@ The bundled `data/channels.csv` seed contains 55,859 IDs. The documented local
 subscriber run retained 55,239 channels after 620 were removed. Subscriber counts
 are rounded public values, such as `4.16M` → `4160000`.
 
-## Setup
+## Docker quick start
+
+Install Docker Engine with Compose v2, or Docker Desktop, then run:
+
+```sh
+git clone https://github.com/mahmudvibecoding/media.git
+cd media
+sh scripts/setup.sh
+```
+
+The script creates private credentials in `.env`, builds the Python collectors
+and Go proxy tester, starts PostgreSQL, and initializes the `media` and `proxy`
+databases. The final status command waits for database setup to finish. You do
+not need Python, Go, or PostgreSQL installed on the host.
+
+Add a channel and collect its uploads and metadata:
+
+```sh
+docker compose run --rm backend python manage.py add-channels UC4QobU6STFB0P71PMvOGN5A
+docker compose run --rm backend python discover_videos.py --channel-id UC4QobU6STFB0P71PMvOGN5A
+docker compose run --rm backend python collect_video_metadata.py --limit 10 --concurrency 2
+docker compose run --rm backend python manage.py status
+```
+
+Each collector runs once. Discovery, metadata, subscriber, comment, proxy, and
+bulk-worker commands described below use the same arguments in Docker: replace
+`.venv/bin/python` with `docker compose run --rm backend python`. YouTube access
+depends on the host's network and YouTube's current response. Failed collection
+is recorded separately from a successful empty result.
+
+The databases start empty. To explicitly import all bundled channel IDs:
+
+```sh
+docker compose run --rm backend python manage.py import-channels
+```
+
+### Storage, restart, and updates
+
+Three named volumes preserve PostgreSQL data, collector state, and output files.
+Inside the backend container, state is at `/var/lib/media/state` and output is at
+`/var/lib/media/outputs`. Use those paths for `--run`, `--output`, and batch files
+that must survive a command finishing. The backend runs as an ordinary user;
+PostgreSQL is available only on the Compose network by default.
+
+```sh
+docker compose down          # Stop; keep all saved data
+sh scripts/setup.sh         # Start again; preserve credentials and data
+```
+
+For an update, pull the new code and rerun setup:
+
+```sh
+git pull --ff-only
+sh scripts/setup.sh
+```
+
+Database setup tracks migration checksums and applies new migrations once.
+It refuses an existing database without migration history. Existing manually
+managed installations should continue using the migration instructions in
+[db/README.md](db/README.md); the Docker setup creates fresh databases.
+Back up your database, volumes, and `.env` before upgrading. Keep the existing
+passwords: changing `.env` does not change a PostgreSQL password already stored
+in the database. `docker compose down --volumes` deletes this installation's data.
+
+The PostgreSQL 18 volume uses `/var/lib/postgresql`, following the
+[official image layout](https://hub.docker.com/_/postgres).
+Compose waits for the database health check and successful migration service
+before starting a collector ([startup ordering](https://docs.docker.com/compose/how-tos/startup-order/)).
+
+### Local batch imports
+
+Metadata and statistics importers can read completed or running batches from the
+shared state volume. `--run` reads the run ID from its manifest. `--once` imports
+currently available batches; omit it to wait until the collector finishes.
+
+```sh
+docker compose run --rm backend python metadata_bulk_import.py --run /var/lib/media/state/metadata-run --once
+docker compose run --rm backend python video_stats_bulk_import.py --run /var/lib/media/state/statistics-run --once
+docker compose run --rm backend python comments_bulk_import.py --run /var/lib/media/state/comments-run
+```
+
+The existing SSH import options remain available for workers on another host.
+Use explicit container volume mounts for external catalogs, ranked proxy files,
+or SSH credentials. `import_proxy_lists.py` requires the catalog path through
+`--catalog`; it has no machine-specific default.
+
+### Verify a Docker installation
+
+```sh
+sh scripts/check_docker.sh
+```
+
+This creates a separate disposable Compose project, builds the Go tester with
+race checks, and runs every Python test against isolated PostgreSQL databases.
+It then runs a deterministic HTTP-fixture collection cycle through discovery,
+metadata, statistics, and paginated comments, including repeat discovery and
+batch replay. It restarts the containers and verifies the database, state, and
+output volumes. Test resources are removed afterward; logs remain at the printed
+report path. The fixture cycle does not depend on live YouTube availability.
+
+## Native development setup
 
 Use Python 3.11 or newer:
 
@@ -684,9 +784,20 @@ capture reports under `outputs/subscribers-20260929/`.
 
 Optional environment variables:
 
-- `MEDIA_DATABASE_URL`: PostgreSQL connection string; defaults to this project's local socket.
+- `MEDIA_DATABASE_URL` and `PROXY_DATABASE_URL`: separate PostgreSQL connection
+  strings for collection data and the proxy catalog. They accept URLs or libpq
+  `key=value` strings.
+- `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`: standard PostgreSQL
+  settings. With no connection string or host/service setting, native tools use
+  the project-local socket; libpq selects the operating-system user or `PGUSER`.
+- `MEDIA_STATE_DIR`: writable state and downloaded proxy storage; defaults to `.local/`.
+- `MEDIA_OUTPUT_DIR`: collector output root; defaults to `outputs/`.
+- `MEDIA_PROXY_BRIDGE_BINARY`: Go tester binary; defaults to `.local/bin/proxy-tester`.
 - `MEDIA_PROXY_URL`: proxy URL, if needed; defaults to a direct connection.
 - `YOUTUBE_CLIENT_VERSION`: override the tested InnerTube WEB client version.
+
+Compose supplies the container database and storage settings. To override a
+setting for a command, use `docker compose run --rm -e NAME=value backend ...`.
 
 ## Check the worker
 
@@ -754,8 +865,9 @@ The same two-proxy confirmation applies when an identity-checked response expose
 neither count. Partial results are saved immediately. Statistics collection uses
 `/next`; the bulk worker does not call `/player`.
 
-On the database machine, `video_stats_bulk_import.py` accepts `--host`, `--remote`,
-`--local`, and the manifest's `--run-id`. It validates file hashes, sequence numbers,
+On the database machine, `video_stats_bulk_import.py` accepts `--run RUN` for a local
+run, or `--host`, `--remote`, `--local`, and the manifest's `--run-id` for an SSH worker.
+It validates file hashes, sequence numbers,
 video identities, source counts, and proxy observations before importing. Repeating
 the same batch does not increase counters again. Newer partial observations retain
 previously collected counts and record the missing fields in `stats_error`.

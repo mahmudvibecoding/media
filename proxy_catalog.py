@@ -14,10 +14,11 @@ import psycopg
 
 from proxy_statistics import ProxyTarget, website_prefix
 from proxy_formats import unpack_connection_settings
+from runtime_config import BRIDGE_BINARY, STATE_DIR, connect_database
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_BRIDGE_BINARY = ROOT / '.local/bin/proxy-tester'
+DEFAULT_BRIDGE_BINARY = BRIDGE_BINARY
 SUPPORTED_PROTOCOLS = frozenset(('http', 'https', 'socks4', 'socks5', 'vmess', 'vless', 'trojan',
     'shadowsocks', 'shadowsocksr', 'hysteria', 'hysteria2', 'tuic', 'wireguard', 'anytls'))
 
@@ -44,8 +45,7 @@ class CatalogProxy:
 def load_catalog(proxy_ids=None, protocols=None, *, website='youtube', connection=None):
     """Load known responders, or explicitly selected IDs, preserving full settings."""
     if connection is None:
-        with psycopg.connect(dbname='proxy', user='mahmud', host=str(ROOT/'.local/postgres/socket'),
-                            port=5432, application_name='metadata-proxy-catalog') as conn:
+        with connect_database("proxy", application_name='metadata-proxy-catalog') as conn:
             return load_catalog(proxy_ids, protocols, website=website, connection=conn)
     site = website_prefix(website)
     identifiers = list(dict.fromkeys(proxy_ids or []))
@@ -96,8 +96,8 @@ class CatalogClients:
     async def __aenter__(self):
         if not self.binary.is_file():
             raise RuntimeError('Build the catalog bridge: cd proxy-tester && go build -o ../.local/bin/proxy-tester .')
-        (ROOT/'.local').mkdir(exist_ok=True)
-        self._directory = tempfile.TemporaryDirectory(prefix='proxy-bridge-', dir=ROOT/'.local')
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._directory = tempfile.TemporaryDirectory(prefix='proxy-bridge-', dir=STATE_DIR)
         folder = Path(self._directory.name)
         manifest, auth_file = folder/'catalog.jsonl', folder/'auth'
         self._token = secrets.token_hex(32)

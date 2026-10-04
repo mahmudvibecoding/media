@@ -22,6 +22,7 @@ import psycopg
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from proxy_statistics import proxy_connection_error
+from runtime_config import connect_database
 
 COLUMNS = ('proxy_id,connection_key,checked_at,status,attempted,responds,'
            'declared_protocol,detected_protocol,http_status,total_ms,requests_sent,'
@@ -234,8 +235,7 @@ def main():
     if args.batch_size < 1:
         parser.error('batch size must be positive')
     os.umask(0o077)
-    with psycopg.connect(dbname='proxy',user='mahmud',host=str(ROOT / '.local/postgres/socket'),
-                         port=5432,connect_timeout=5,autocommit=True) as conn:
+    with connect_database("proxy", connect_timeout=5, autocommit=True) as conn:
         conn.execute("SET temp_buffers = '128MB'")
         conn.execute("SET work_mem = '128MB'")
         conn.execute('SET jit = off')

@@ -18,6 +18,7 @@ import psycopg
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from proxy_formats import unpack_connection_settings
+from runtime_config import connect_database
 
 
 def encoded(record):
@@ -66,8 +67,7 @@ def main():
         manifest["shards"][-1].update(bytes=destination.stat().st_size, sha256=checksum)
         compressed = raw = temporary = None
 
-    with psycopg.connect(dbname="proxy", user="mahmud", host=str(ROOT / ".local/postgres/socket"),
-                         port=5432, connect_timeout=5,
+    with connect_database("proxy", connect_timeout=5,
                          options="-c default_transaction_read_only=on") as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         expected = conn.execute("SELECT count(*) FROM public.proxies").fetchone()[0]

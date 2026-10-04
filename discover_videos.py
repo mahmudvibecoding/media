@@ -19,6 +19,7 @@ import httpx
 import psycopg
 
 from collect_subscribers import CLIENT_VERSION, ENDPOINT, ROOT, positive_int
+from runtime_config import OUTPUT_DIR, connect_database
 
 
 TABS = {
@@ -275,11 +276,7 @@ async def fetch_page(client, channel_id, video_type, client_version=CLIENT_VERSI
 
 
 def open_database(*, autocommit=False):
-    dsn = os.environ.get("MEDIA_DATABASE_URL")
-    return psycopg.connect(dsn, autocommit=autocommit) if dsn else psycopg.connect(
-        host=str(ROOT / ".local/postgres/socket"), port=5432, user="mahmud", dbname="media",
-        autocommit=autocommit,
-    )
+    return connect_database("media", autocommit=autocommit)
 
 
 def select_channels(args):
@@ -407,7 +404,7 @@ async def collect(args):
     channels = select_channels(args)
     selected_tabs = select_tabs(channels)
     selected_channels = len({channel_id for channel_id, _ in selected_tabs})
-    out = args.output or ROOT / "outputs" / (
+    out = args.output or OUTPUT_DIR / (
         "discovery-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     )
     out.mkdir(parents=True, exist_ok=False)

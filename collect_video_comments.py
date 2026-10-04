@@ -25,6 +25,7 @@ import psycopg
 from collect_subscribers import CLIENT_VERSION, ROOT, positive_int
 from collect_video_metadata import RequestTrace, local_worker_error, request_error_label
 from discover_videos import VIDEO_ID, dig, open_database
+from runtime_config import OUTPUT_DIR
 from proxy_statistics import AttemptOutcome, proxy_connection_error
 
 
@@ -557,7 +558,7 @@ def save_scan(conn, result, buffer):
 
 
 async def run(args):
-    output = (args.output or ROOT / "outputs" / ("comments-" + args.video_id + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))).resolve()
+    output = (args.output or OUTPUT_DIR / ("comments-" + args.video_id + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))).resolve()
     output.mkdir(parents=True, exist_ok=False)
     with open_database(autocommit=True) as conn, tempfile.TemporaryDirectory(prefix="comment-scan-") as folder:
         lock = ("media.video-comments:" + args.video_id,)

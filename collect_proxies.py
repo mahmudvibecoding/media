@@ -27,10 +27,9 @@ from psycopg.types.json import Jsonb
 
 from proxy_formats import PARSER_VERSION, Proxy, canonical_json, pack_connection_settings, parse_proxies
 from proxy_pagination import next_page
+from runtime_config import ROOT, STATE_DIR, connect_database
 
-ROOT = Path(__file__).resolve().parent
-STORAGE = ROOT / '.local' / 'proxy-collection'
-DB = {'dbname': 'proxy', 'user': 'mahmud', 'host': str(ROOT / '.local/postgres/socket'), 'port': 5432}
+STORAGE = STATE_DIR / 'proxy-collection'
 DOWNLOAD_COLUMNS = (
     'status', 'started_at', 'finished_at', 'http_status', 'attempts', 'final_url',
     'content_type', 'decoded_bytes', 'received_body_bytes', 'content_sha256', 'payload_path',
@@ -52,7 +51,7 @@ def stored_settings(settings, protocol):
 
 
 def connection():
-    return psycopg.connect(**DB, autocommit=True, row_factory=dict_row)
+    return connect_database("proxy", autocommit=True, row_factory=dict_row)
 
 
 def format_hint_for_url(url):
@@ -81,9 +80,6 @@ def same_parsed_entries(left, right):
 class Store:
     def __init__(self):
         self.control = connection()
-        identity = self.control.execute('SELECT current_database() AS db, current_user AS usr').fetchone()
-        if identity != {'db': 'proxy', 'usr': 'mahmud'}:
-            raise RuntimeError('Unexpected database')
         locked = self.control.execute(
             "SELECT pg_try_advisory_lock(hashtextextended('proxy:proxy_collection',0)) AS locked"
         ).fetchone()['locked']

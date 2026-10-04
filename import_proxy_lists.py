@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import psycopg
-from collect_proxies import DB, ROOT
+from runtime_config import connect_database
 
 
 def import_lists(conn, rows):
@@ -32,9 +31,9 @@ def import_lists(conn, rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--catalog',type=Path,default=ROOT/'outputs/research/proxy-list-database-20260930/catalog.jsonl')
+    parser.add_argument('--catalog',type=Path,required=True)
     args = parser.parse_args()
-    with args.catalog.open() as source, psycopg.connect(**DB,autocommit=True) as conn:
+    with args.catalog.open() as source, connect_database("proxy", autocommit=True) as conn:
         rows = (json.loads(line) for line in source if line.strip())
         changed = import_lists(conn,rows)
         total,enabled = conn.execute('SELECT count(*),count(*) FILTER (WHERE enabled) FROM proxy_lists').fetchone()

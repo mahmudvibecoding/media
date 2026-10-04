@@ -12,6 +12,7 @@ import time
 import psycopg
 
 from import_results import import_journal
+from runtime_config import connect_database
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -150,8 +151,7 @@ def main():
     args=parser.parse_args()
     started=time.monotonic()
     report={'started_at':datetime.now(timezone.utc).isoformat(),'applied':False}
-    with psycopg.connect(dbname='proxy',user='mahmud',host=str(ROOT/'.local/postgres/socket'),
-                         port=5432,autocommit=True,application_name='proxy-connection-backfill') as conn:
+    with connect_database("proxy", autocommit=True, application_name='proxy-connection-backfill') as conn:
         report['journals']=stage_history(conn,discover_journals(args.paths))
         validate_history(conn)
         report['history']=history_summary(conn)

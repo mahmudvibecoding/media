@@ -13,6 +13,7 @@ import time
 
 import httpx
 import psycopg
+from runtime_config import OUTPUT_DIR, connect_database
 
 ROOT = Path(__file__).resolve().parent
 ENDPOINT = "https://www.youtube.com/youtubei/v1/browse"
@@ -166,11 +167,7 @@ def save_count(conn, result):
 
 
 async def collect(args):
-    dsn = os.environ.get("MEDIA_DATABASE_URL")
-    connection = psycopg.connect(dsn, autocommit=True) if dsn else psycopg.connect(
-        host=str(ROOT / ".local/postgres/socket"), port=5432,
-        user="mahmud", dbname="media", autocommit=True,
-    )
+    connection = connect_database("media", autocommit=True)
     with connection as conn:
         locked = conn.execute(
             "SELECT pg_try_advisory_lock(hashtext('media.subscriber-count'))"
@@ -186,7 +183,7 @@ async def collect(args):
         channels = [row[0] for row in conn.execute(
             query, None if args.all else (args.limit,)
         ).fetchall()]
-        run_dir = args.output or ROOT / "outputs" / (
+        run_dir = args.output or OUTPUT_DIR / (
             "subscribers-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         )
         run_dir.mkdir(parents=True, exist_ok=False)

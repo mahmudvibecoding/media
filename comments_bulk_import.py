@@ -21,6 +21,7 @@ import psycopg
 from collect_video_comments import CHANNEL_ID, FIELDS, ROOT, SUCCESS, VIDEO_ID
 from comments_bulk import scan_identity
 from discover_videos import open_database
+from runtime_config import STATE_DIR, connect_database
 from metadata_bulk import atomic_json, digest, load_proxies, utcnow
 from proxy_statistics import Aggregate, AttemptOutcome, IMPORT_LOCK, ProxyTarget, StatisticsBatch, write_batch
 
@@ -429,9 +430,9 @@ def sync_remote(folder, host, remote):
     destination = Path(folder)
     remote = str(remote).rstrip("/")
     socket_id = hashlib.sha256((host + str(destination.resolve())).encode()).hexdigest()[:16]
-    (ROOT / ".local").mkdir(exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=auto",
-           "-o", "ControlPersist=60", "-o", "ControlPath=" + str(ROOT / ".local" / ("comments-ssh-" + socket_id))]
+           "-o", "ControlPersist=60", "-o", "ControlPath=" + str(STATE_DIR / ("comments-ssh-" + socket_id))]
     subprocess.run(["rsync", "-a", "--ignore-existing", "--include=*/", "--include=*.jsonl.gz",
         "--include=*.jsonl.gz.json", "--exclude=*", "-e", shlex.join(ssh),
         host + ":" + shlex.quote(remote + "/outbox/"), str(destination / "outbox") + "/"],
@@ -474,8 +475,7 @@ def sync(folder, *, host=None, remote=None, watch=False, interval=5):
                         if watch and time.monotonic() - started >= 2:
                             break
                     if proxy is None or proxy.closed:
-                        proxy = psycopg.connect(dbname="proxy", user="mahmud", host=str(ROOT / ".local/postgres/socket"),
-                                               port=5432, autocommit=True, application_name="bulk-comments-import")
+                        proxy = connect_database("proxy", autocommit=True, application_name="bulk-comments-import")
                     started = time.monotonic()
                     for path in ready_batches(folder, kind="events", after=journal.cursor("events")):
                         result = apply_proxy_batch(proxy, journal, path)

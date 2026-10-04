@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 import uuid
 
 import psycopg
+from runtime_config import connect_database
 
 from proxy_formats import Proxy
 
@@ -314,8 +315,7 @@ def write_batch(conn, batch):
 
 
 def write_to_database(batch):
-    with psycopg.connect(dbname='proxy', user='mahmud', host=str(ROOT/'.local/postgres/socket'),
-                         port=5432, connect_timeout=5, autocommit=True,
+    with connect_database("proxy", connect_timeout=5, autocommit=True,
                          application_name='proxy-statistics') as conn:
         return write_batch(conn, batch)
 
