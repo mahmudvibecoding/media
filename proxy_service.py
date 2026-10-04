@@ -1,6 +1,8 @@
 """Continuously synchronize the catalog, test proxies, and publish a ranked pool."""
 import argparse
 import asyncio
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
@@ -48,6 +50,7 @@ class Settings:
     client_version: str = CLIENT_VERSION
     connect_timeout: int = 3
     request_timeout: int = 10
+    import_workers: int = 4
 
     @classmethod
     def environment(cls):
@@ -55,7 +58,8 @@ class Settings:
         names = {"sync_interval": "SYNC_INTERVAL", "retest_interval": "RETEST_INTERVAL",
                  "test_concurrency": "TEST_CONCURRENCY", "batch_size": "TEST_BATCH_SIZE",
                  "quality_sample": "QUALITY_SAMPLE", "quality_concurrency": "QUALITY_CONCURRENCY",
-                 "quality_interval": "QUALITY_INTERVAL", "journal_retention": "JOURNAL_RETENTION"}
+                 "quality_interval": "QUALITY_INTERVAL", "journal_retention": "JOURNAL_RETENTION",
+                 "import_workers": "IMPORT_WORKERS"}
         for field, name in names.items():
             if "MEDIA_PROXY_" + name in os.environ:
                 values[field] = int(os.environ["MEDIA_PROXY_" + name])
@@ -63,7 +67,7 @@ class Settings:
         validate_repository(result.repository)
         if (result.sync_interval < 1 or result.retest_interval < 1 or result.quality_interval < 1
                 or result.test_concurrency < 0 or result.batch_size < 0 or result.quality_sample < 0
-                or result.quality_concurrency < 1 or result.journal_retention < 1):
+                or result.quality_concurrency < 1 or result.journal_retention < 1 or result.import_workers < 1):
             raise ValueError("Proxy service settings must be positive; zero selects automatic test sizing")
         concurrency = result.test_concurrency or automatic_concurrency()
         return replace(result, test_concurrency=concurrency, batch_size=result.batch_size or min(1000000, concurrency * 16))
@@ -97,9 +101,8 @@ def event(kind, **fields):
     print(json.dumps({"event": kind, "at": utcnow(), **fields}, default=str), flush=True)
 
 
-def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False,
-               round_id=None, pass_number=None):
-    started = time.monotonic()
+def prepare_batch(home, settings, *, after_id=None, max_id=None, round_id=None, pass_number=None):
+    """Publish a durable batch before any network work can be scheduled."""
     home = Path(home)
     checkpoint = home / "current-test.json"
     current = read_json(checkpoint)
@@ -125,6 +128,20 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     manifest = folder / "manifest.json"
     if digest(manifest) != current["manifest_sha256"]:
         raise ValueError("Saved test input changed")
+    return current
+
+
+def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False,
+               round_id=None, pass_number=None, test_lock=None, parallel_import=False):
+    started = time.monotonic()
+    home = Path(home)
+    checkpoint = home / "current-test.json"
+    current = prepare_batch(home, settings, after_id=after_id, max_id=max_id,
+                            round_id=round_id, pass_number=pass_number)
+    if current is None:
+        return None
+    folder = home / "runs" / current["run_id"]
+    manifest = folder / "manifest.json"
     exported = time.monotonic()
     saved = Settings(**current["settings"])
     journal = folder / "results.jsonl"
@@ -133,7 +150,9 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     if current["phase"] == "testing":
         event("proxy_test_started", run_id=current["run_id"], concurrency=concurrency,
               selected=read_json(manifest)["records"])
-        with (folder / "tester.log").open("a") as log:
+        with test_lock or nullcontext(), (folder / "tester.log").open("a") as log:
+            if stop.is_set():
+                raise InterruptedError("Prepared test batch retained for restart")
             code = run_owned([str(BRIDGE_BINARY), "--input", str(manifest), "--output", str(journal),
                 "--run-id", current["run_id"], "--concurrency", str(concurrency),
                 "--connect-timeout", f"{saved.connect_timeout}s", "--total-timeout", f"{saved.request_timeout}s",
@@ -158,8 +177,9 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     tested = time.monotonic()
     status.update(state="importing_tests")
     with connect_database("proxy", autocommit=True) as conn:
+        conn.execute("SET temp_buffers = '128MB'")
         report = import_test_journal(conn, journal, retest_seconds=settings.retest_interval,
-                                     round_id=round_id, pass_number=pass_number)
+                                     round_id=round_id, pass_number=pass_number, parallel=parallel_import)
     report["seconds"] = {"prepare": round(exported-started, 2), "test": round(tested-exported, 2),
                          "import": round(time.monotonic()-tested, 2), "total": round(time.monotonic()-started, 2)}
     write_json(folder / "completed.json", {**report, "completed_at": utcnow().isoformat()})
@@ -168,6 +188,74 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     status.update(last_test=report)
     event("proxy_test_imported", run_id=current["run_id"], **report)
     return report
+
+
+def refresh_batches(home, batch_home, current, settings, stop, status, owner):
+    """Overlap export, one network tester, and imports of disjoint proxy ranges.
+
+    Each range has its own durable checkpoint. Only a committed prefix advances
+    the run cursor, so a restart replays completed imports without retesting.
+    """
+    checkpoint = home / "current-refresh.json"
+    legacy = batch_home / "current-test.json"
+    saved = read_json(legacy)
+    if saved and saved["run_id"] == current["last_batch"]:
+        legacy.unlink()
+    test_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=settings.import_workers, thread_name_prefix="proxy-batch") as workers:
+        try:
+            while current["pass"] <= 3:
+                pass_number = current["pass"]
+                cursor, exhausted, pending = current["after_id"], False, []
+                while pending or not exhausted:
+                    if stop.is_set():
+                        raise InterruptedError("Pipeline checkpoints saved; invoke the command to resume")
+                    owner.execute("SELECT 1")
+                    while not exhausted and len(pending) < settings.import_workers:
+                        folder = batch_home if legacy.exists() and cursor == current["after_id"] else (
+                            batch_home / "batches" / f"{pass_number}-{cursor}")
+                        started = time.monotonic()
+                        prepared = prepare_batch(folder, settings, after_id=cursor, max_id=current["max_id"],
+                                                 round_id=current["run_id"], pass_number=pass_number)
+                        if prepared is None:
+                            exhausted = True
+                            break
+                        future = workers.submit(test_batch, folder, settings, stop, status,
+                            after_id=cursor, max_id=current["max_id"], retain_checkpoint=True,
+                            round_id=current["run_id"], pass_number=pass_number,
+                            test_lock=test_lock, parallel_import=True)
+                        pending.append({"folder": folder, "saved": prepared, "future": future,
+                                        "prepare_seconds": round(time.monotonic()-started, 2)})
+                        cursor = prepared["last_proxy_id"]
+                        exhausted = cursor >= current["max_id"]
+                    while pending and pending[0]["future"].done():
+                        item = pending.pop(0)
+                        report = item["future"].result()
+                        saved = item["saved"]
+                        current.update(after_id=saved["last_proxy_id"], last_batch=saved["run_id"],
+                                       observations=current["observations"] + report["observations"])
+                        write_json(checkpoint, current)
+                        (item["folder"] / "current-test.json").unlink()
+                        event("proxy_pipeline_committed", run_id=saved["run_id"], pass_number=pass_number,
+                              observations=current["observations"], prepare_seconds=item["prepare_seconds"])
+                        if pass_number == 3:
+                            with connect_database("proxy", autocommit=True) as conn:
+                                export_pool(conn, home)
+                    status.update(state="pipeline", pass_number=pass_number,
+                        configurations=current["configurations"], observations=current["observations"],
+                        pipeline=[{"run_id": item["saved"]["run_id"], "home": str(item["folder"]),
+                                   "done": item["future"].done()} for item in pending],
+                        import_workers=settings.import_workers, concurrency=settings.test_concurrency)
+                    if pending:
+                        unfinished = [item["future"] for item in pending if not item["future"].done()]
+                        if unfinished:
+                            wait(unfinished, timeout=0.25, return_when=FIRST_COMPLETED)
+                event("proxy_pass_completed", pass_number=pass_number, configurations=current["configurations"])
+                current.update({"pass": pass_number + 1, "after_id": 0})
+                write_json(checkpoint, current)
+        except BaseException:
+            stop.set()
+            raise
 
 
 def refresh(home, settings, stop, status, owner):
@@ -192,6 +280,8 @@ def refresh(home, settings, stop, status, owner):
     batch_home = home / "manual-runs" / current["run_id"]
     batch_home.mkdir(parents=True, exist_ok=True)
     batch_checkpoint = batch_home / "current-test.json"
+    if settings.import_workers > 1:
+        refresh_batches(home, batch_home, current, settings, stop, status, owner)
     while current["pass"] <= 3:
         if stop.is_set():
             raise InterruptedError("Progress saved; invoke the command to resume")
@@ -393,6 +483,9 @@ def clean_completed(home, retention):
                 completed = read_json(marker)
                 if datetime.fromisoformat(completed["completed_at"]).timestamp() < cutoff:
                     shutil.rmtree(folder)
+    for batch in (home / "batches").glob("*"):
+        if batch.is_dir() and not batch.is_symlink():
+            clean_completed(batch, retention)
 
 
 def sync_worker(home, settings, stop, dirty, status):

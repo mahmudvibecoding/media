@@ -60,6 +60,11 @@ verifies checksums and restored table fingerprints, and imports new configuratio
 while preserving IDs and server statistics. It then tests **every configuration
 in that catalog three times**, in three complete passes, with **80,000 concurrent
 checks** and batches of up to one million. Recently tested proxies are included.
+Input export, network testing, and database imports overlap. Up to four batches
+can be in flight (`MEDIA_PROXY_IMPORT_WORKERS`); only one network tester runs at
+a time, so the total network concurrency remains 80,000. Each batch has a durable
+checkpoint, and the run cursor advances only after its database commit. Saved
+results can be replayed after a restart without repeating checks or counters.
 A detected local resource overload reduces concurrency for the saved batch.
 
 Each invocation runs once and exits with a summary. Setup does not launch the

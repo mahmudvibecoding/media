@@ -526,7 +526,7 @@ class DatabaseTests(unittest.TestCase):
             Path(str(path)+'.summary.json').write_text(json.dumps({'state':'complete','counters':
                 {'completed':len(rows),'attempted':len(rows),'youtube_responses':len(rows)}}))
             return 0
-        settings = Settings(batch_size=2, test_concurrency=2)
+        settings = Settings(batch_size=2, test_concurrency=2, import_workers=1)
         stop = threading.Event()
         status = service.Status(self.folder, stop)
         write = service.write_json
@@ -571,6 +571,82 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(report['exported'], 4100)
         self.assertEqual(report['limit'], 0)
         self.assertEqual(len((self.folder/'ranked-proxies.jsonl').read_text().splitlines()), 4100)
+
+    def test_bulk_export_preserves_escaped_and_unicode_options(self):
+        options = {'password': 'quote" slash\\ newline\n delimiter\x01\x02 zero\x00', 'label': 'unicode ✓'}
+        proxy = Proxy('203.0.113.1', 8080, 'http', options)
+        identifier = self.live.execute('''INSERT INTO public.proxies
+            (connection_key,address,port,connection_settings,last_seen_at)
+            VALUES (%s,%s,%s,%s,clock_timestamp()) RETURNING proxy_id''',
+            (proxy.key, proxy.address, proxy.port, Jsonb(pack_connection_settings(proxy.protocol, options)))).fetchone()[0]
+        manifest = export_due(self.live, self.folder/'bulk', after_id=0, max_id=identifier, limit=100)
+        rows = (self.folder/'bulk/input.jsonl').read_text().splitlines()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0])['settings'], options)
+        self.assertEqual(manifest['last_proxy_id'], identifier)
+        self.assertEqual(manifest['shards'][0]['sha256'], digest(self.folder/'bulk/input.jsonl'))
+
+    def pipeline_resume(self, after):
+        self.seed(self.live, 3)
+        checked = []
+        second_test = threading.Event()
+        overlap = threading.Event()
+        def connect(*args, **kwargs):
+            return psycopg.connect(**{**self.options, 'dbname': self.names[0]}, autocommit=True)
+        def tester(command, **kwargs):
+            path = Path(command[command.index('--output')+1])
+            manifest = Path(command[command.index('--input')+1])
+            run_id = command[command.index('--run-id')+1]
+            rows = []
+            for item in map(json.loads, (manifest.parent/'input.jsonl').read_text().splitlines()):
+                checked.append(item['id'])
+                if item['id'] == 2:
+                    second_test.set()
+                rows.append({'id':item['id'], 'key':item['key'], 'declared_protocol':'http', 'detected_protocol':'http',
+                    'tested_at':utcnow().isoformat(), 'status':'responds', 'attempted':True, 'responds':True, 'total_ms':20,
+                    'attempts':[{'protocol':'http','status':'responds','http_status':429,'tls_verified':True,
+                                 'connected':True,'request_sent':True,'body_complete':False}]})
+            path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+            Path(str(path)+'.meta.json').write_text(json.dumps({'run_id':run_id,'input_sha256':digest(manifest)}))
+            Path(str(path)+'.summary.json').write_text(json.dumps({'state':'complete','counters':
+                {'completed':len(rows),'attempted':len(rows),'youtube_responses':len(rows)}}))
+            return 0
+        real_import = service.import_test_journal
+        def importing(conn, path, **kwargs):
+            if json.loads(Path(path).read_text())['id'] == 1 and kwargs['pass_number'] == 1:
+                if not second_test.wait(5):
+                    raise RuntimeError('Network testing waited for the previous import')
+                overlap.set()
+            return real_import(conn, path, **kwargs)
+        real_write = service.write_json
+        def interrupted(path, value):
+            if Path(path).name == 'current-refresh.json' and value['observations'] == 1:
+                if after:
+                    real_write(path, value)
+                raise RuntimeError('injected pipeline progress interruption')
+            real_write(path, value)
+        settings = Settings(batch_size=1, test_concurrency=2, import_workers=3)
+        with patch.object(service, 'connect_database', side_effect=connect), \
+                patch.object(service, 'synchronize', return_value={}), \
+                patch.object(service, 'run_owned', side_effect=tester), \
+                patch.object(service, 'import_test_journal', side_effect=importing):
+            stop = threading.Event()
+            with patch.object(service, 'write_json', side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, 'pipeline progress interruption'):
+                    service.refresh(self.folder, settings, stop, service.Status(self.folder,stop), self.live)
+            stop = threading.Event()
+            result = service.refresh(self.folder, settings, stop, service.Status(self.folder,stop), self.live)
+        self.assertTrue(overlap.is_set())
+        self.assertEqual(result['observations'], 9)
+        self.assertEqual(sorted(checked), [1,1,1,2,2,2,3,3,3])
+        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall(), [(3,),(3,),(3,)])
+        self.assertEqual(self.live.execute('SELECT response_count FROM app_meta.proxy_pool_results ORDER BY proxy_id').fetchall(), [(3,),(3,),(3,)])
+
+    def test_pipeline_overlaps_and_resumes_before_progress_commit(self):
+        self.pipeline_resume(False)
+
+    def test_pipeline_overlaps_and_resumes_after_progress_commit(self):
+        self.pipeline_resume(True)
 
     def test_real_go_manual_command_completes_three_passes(self):
         if not service.BRIDGE_BINARY.is_file():

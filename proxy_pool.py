@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import uuid
 
+from psycopg import sql
+
 from proxy_formats import unpack_connection_settings
 from proxy_service_common import SERVICE_DIR, digest, file_lock, utcnow, write_json
 from proxy_statistics import AttemptOutcome, IMPORT_LOCK
@@ -69,14 +71,15 @@ def retry_after(value, at):
         return 0
 
 
-def apply_observations(conn, observations, journal_key, run_id, *, retest_seconds=21600, quality=False, _staged=False, _retry_delays=None):
+def apply_observations(conn, observations, journal_key, run_id, *, retest_seconds=21600, quality=False, _staged=False, _retry_delays=None, _parallel=False):
     """Receipts make late and replayed batches safe without resetting newer fields."""
     if len(journal_key) != 32 or not 0 < retest_seconds <= 365 * 86400:
         raise ValueError("Invalid observation import settings")
     rows = [] if _staged else [observation.row() for observation in observations]
     count = conn.execute("SELECT count(*) FROM import_proxy_results").fetchone()[0] if _staged else len(rows)
     with conn.transaction():
-        if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (IMPORT_LOCK,)).fetchone()[0]:
+        lock = "pg_try_advisory_xact_lock_shared" if _parallel else "pg_try_advisory_xact_lock"
+        if not conn.execute(sql.SQL("SELECT {}(%s)").format(sql.Identifier(lock)), (IMPORT_LOCK,)).fetchone()[0]:
             raise RuntimeError("Another statistics writer is active; saved observations will retry")
         saved = conn.execute("""INSERT INTO app_meta.proxy_observation_imports
             (journal_sha256,run_id,observations) VALUES (%s,%s,%s)
@@ -108,6 +111,7 @@ def apply_observations(conn, observations, journal_key, run_id, *, retest_second
             with conn.cursor().copy("COPY service_observations FROM STDIN") as copy:
                 for row in rows:
                     copy.write_row(row)
+        conn.execute("ANALYZE service_observations")
         if conn.execute("""SELECT EXISTS(SELECT 1 FROM service_observations s
             LEFT JOIN public.proxies p USING(proxy_id) WHERE p.proxy_id IS NULL
             OR p.connection_key<>s.connection_key
@@ -242,9 +246,12 @@ def record_round_results(conn, round_id, pass_number):
         WHERE excluded.completed_at>p.completed_at""", (round_id,))
 
 
-def import_test_journal(conn, path, *, retest_seconds=21600, round_id=None, pass_number=None):
+def import_test_journal(conn, path, *, retest_seconds=21600, round_id=None, pass_number=None, parallel=False):
     if (round_id is None) != (pass_number is None):
         raise ValueError("A scored batch needs both its run and pass number")
+    # Large batches otherwise spill sorts and joins with PostgreSQL's 4 MB default.
+    conn.execute("SET work_mem = '128MB'")
+    conn.execute("SET jit = off")
     # Validate and parse each line once, then transfer staged rows inside PostgreSQL.
     retry_delays = {}
     def observe(result, checked):
@@ -254,9 +261,10 @@ def import_test_journal(conn, path, *, retest_seconds=21600, round_id=None, pass
             if seconds:
                 retry_delays[result["id"]] = seconds
     report = _journal.import_journal(conn, path, 10000, stage_only=True, on_result=observe)
+    conn.execute("ANALYZE import_proxy_results")
     with conn.transaction():
         result = apply_observations(conn, (), report["journal_key"], report["run"],
-                                    retest_seconds=retest_seconds, _staged=True, _retry_delays=retry_delays)
+                                    retest_seconds=retest_seconds, _staged=True, _retry_delays=retry_delays, _parallel=parallel)
         if round_id is not None:
             record_round_results(conn, round_id, pass_number)
     return result
@@ -266,6 +274,37 @@ def export_due(conn, folder, *, limit=2000, now=None, after_id=None, max_id=None
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=False, mode=0o700)
     now = now or utcnow()
+    if after_id is not None:
+        # PostgreSQL already has the JSON. COPY avoids decoding and encoding a
+        # million option dictionaries in Python for every batch and every pass.
+        source = folder / "input.jsonl"
+        selection = sql.SQL("""SELECT proxy_id,connection_key,address,port,connection_settings
+            FROM public.proxies WHERE proxy_id>{} AND proxy_id<={}
+            ORDER BY proxy_id LIMIT {}""").format(sql.Literal(after_id), sql.Literal(max_id), sql.Literal(limit))
+        query = sql.SQL("""COPY (SELECT json_build_object(
+            'id',proxy_id,'key',encode(connection_key,'hex'),'address',address,'port',port,
+            'protocol',connection_settings->>'transport','settings',
+            CASE WHEN jsonb_typeof(connection_settings->'options')='string'
+                 THEN (connection_settings->>'options')::json
+                 ELSE (connection_settings->'options')::json END)
+            FROM ({}) selected) TO STDOUT
+            WITH (FORMAT csv, DELIMITER E'\\x02', QUOTE E'\\x01', ESCAPE E'\\x01')""").format(selection)
+        with conn.transaction(), source.open("wb", buffering=1024*1024) as output:
+            os.chmod(source, 0o600)
+            with conn.cursor().copy(query) as copy:
+                for block in copy:
+                    output.write(block)
+            count, last_id = conn.execute(sql.SQL("SELECT count(*),max(proxy_id) FROM ({}) selected").format(selection)).fetchone()
+            output.flush()
+            os.fsync(output.fileno())
+        if not count:
+            source.unlink()
+            folder.rmdir()
+            return None
+        manifest = {"schema_version": 1, "records": count, "last_proxy_id": last_id, "shards": [
+            {"file": source.name, "records": count, "bytes": source.stat().st_size, "sha256": digest(source)}]}
+        write_json(folder / "manifest.json", manifest)
+        return manifest
     # Stream large batches through a server cursor instead of retaining every
     # configuration in Python while the Go worker uses its own memory budget.
     source = folder / "input.jsonl"
