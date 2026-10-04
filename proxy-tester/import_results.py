@@ -27,6 +27,7 @@ from runtime_config import connect_database
 COLUMNS = ('proxy_id,connection_key,checked_at,status,attempted,responds,'
            'declared_protocol,detected_protocol,http_status,total_ms,requests_sent,'
            'connected,connection_error,website_error')
+ERROR_LABEL = re.compile(r'[a-z][a-z0-9_]*:[a-z][a-z0-9_]*')
 
 
 def connection_observation(result):
@@ -48,7 +49,7 @@ def connection_observation(result):
     if result['responds']:
         stage, code = None, None
     error = f'{stage}:{code}' if stage and code else None
-    if error is not None and re.fullmatch(r'[a-z][a-z0-9_]*:[a-z][a-z0-9_]*', error) is None:
+    if error is not None and ERROR_LABEL.fullmatch(error) is None:
         raise ValueError('Invalid connection error label in journal')
     return connected, proxy_connection_error(error)
 
@@ -62,7 +63,7 @@ def website_error(result, connection_error):
         error = last['stage'] + ':' + last['error_code']
     if error is None and result['responds'] and last.get('http_status', 0) >= 300:
         error = 'http:http_' + str(last['http_status'])
-    if error is not None and re.fullmatch(r'[a-z][a-z0-9_]*:[a-z][a-z0-9_]*', error) is None:
+    if error is not None and ERROR_LABEL.fullmatch(error) is None:
         raise ValueError('Invalid website error label in journal')
     return error
 

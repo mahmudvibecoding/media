@@ -250,7 +250,7 @@ def import_test_journal(conn, path, *, retest_seconds=21600, round_id=None, pass
     if (round_id is None) != (pass_number is None):
         raise ValueError("A scored batch needs both its run and pass number")
     # Large batches otherwise spill sorts and joins with PostgreSQL's 4 MB default.
-    conn.execute("SET work_mem = '128MB'")
+    conn.execute("SET work_mem = '512MB'")
     conn.execute("SET jit = off")
     # Validate and parse each line once, then transfer staged rows inside PostgreSQL.
     retry_delays = {}

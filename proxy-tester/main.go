@@ -211,7 +211,14 @@ func run(args []string) (int, error) {
 	}()
 	options := Options{ConnectTimeout: *connectTimeout, TotalTimeout: *totalTimeout, TargetURL: metadata.Target, VideoID: *videoID, ClientVersion: *clientVersion}
 	var workers sync.WaitGroup
-	for range *concurrency {
+	workerCount := *concurrency
+	if expected > 0 {
+		workerCount = min(workerCount, int(max(1, expected-previousCount)))
+	}
+	if *limit > 0 {
+		workerCount = min(workerCount, int(*limit))
+	}
+	for range workerCount {
 		workers.Go(func() {
 			for candidate := range jobs {
 				if ctx.Err() != nil {

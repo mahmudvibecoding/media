@@ -1,5 +1,6 @@
 """Catalog identity, download recovery, ranked responses, and durable test imports."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import timedelta
@@ -626,7 +627,10 @@ class DatabaseTests(unittest.TestCase):
                 raise RuntimeError('injected pipeline progress interruption')
             real_write(path, value)
         settings = Settings(batch_size=1, test_concurrency=2, import_workers=3)
+        def threaded_importer(**kwargs):
+            return ThreadPoolExecutor(max_workers=kwargs['max_workers'])
         with patch.object(service, 'connect_database', side_effect=connect), \
+                patch.object(service, 'ProcessPoolExecutor', side_effect=threaded_importer), \
                 patch.object(service, 'synchronize', return_value={}), \
                 patch.object(service, 'run_owned', side_effect=tester), \
                 patch.object(service, 'import_test_journal', side_effect=importing):
@@ -651,14 +655,15 @@ class DatabaseTests(unittest.TestCase):
     def test_real_go_manual_command_completes_three_passes(self):
         if not service.BRIDGE_BINARY.is_file():
             self.skipTest('Build the Go tester before running this integration check')
-        proxy = Proxy('127.0.0.1', 1, 'http', {})
-        self.live.execute('INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at) VALUES (%s,%s,%s,%s,clock_timestamp())',
-            (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
+        for port in (1, 2, 3):
+            proxy = Proxy('127.0.0.1', port, 'http', {})
+            self.live.execute('INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at) VALUES (%s,%s,%s,%s,clock_timestamp())',
+                (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
         def connect(*args, **kwargs):
             return psycopg.connect(**{**self.options, 'dbname': self.names[0]}, autocommit=True)
         stop = threading.Event()
         with patch.object(service, 'connect_database', side_effect=connect), patch.object(service, 'synchronize', return_value={}):
-            result = service.refresh(self.folder, Settings(batch_size=1,test_concurrency=1,connect_timeout=1,request_timeout=1),
+            result = service.refresh(self.folder, Settings(batch_size=1,test_concurrency=2,connect_timeout=1,request_timeout=1),
                                      stop,service.Status(self.folder,stop),self.live)
-        self.assertEqual(result['observations'], 3)
-        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats').fetchone()[0], 3)
+        self.assertEqual(result['observations'], 9)
+        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall(), [(3,), (3,), (3,)])

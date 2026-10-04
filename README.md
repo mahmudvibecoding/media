@@ -58,11 +58,13 @@ sh scripts/update-proxies.sh
 This command checks the latest published [proxy catalog](https://github.com/mahmudvibecoding/proxy-catalog),
 verifies checksums and restored table fingerprints, and imports new configurations
 while preserving IDs and server statistics. It then tests **every configuration
-in that catalog three times**, in three complete passes, with **80,000 concurrent
-checks** and batches of up to one million. Recently tested proxies are included.
-Input export, network testing, and database imports overlap. Up to four batches
-can be in flight (`MEDIA_PROXY_IMPORT_WORKERS`); only one network tester runs at
-a time, so the total network concurrency remains 80,000. Each batch has a durable
+in that catalog three times**, in three complete passes, with concurrency sized
+from CPU and memory and batches of up to one million. Recently tested proxies are included.
+Input export, network testing, and database imports overlap. Separate import processes
+and network testers use multiple CPU cores. `MEDIA_PROXY_TEST_CONCURRENCY`,
+`MEDIA_PROXY_IMPORT_WORKERS`, and `MEDIA_PROXY_TEST_WORKERS` override the automatic
+sizing; zero selects automatic sizing. Testers share the total network concurrency.
+Each batch has a durable
 checkpoint, and the run cursor advances only after its database commit. Saved
 results can be replayed after a restart without repeating checks or counters.
 A detected local resource overload reduces concurrency for the saved batch.

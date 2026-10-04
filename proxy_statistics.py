@@ -36,10 +36,11 @@ CONNECTION_ERROR_PATTERN = (
     r'|proxy_handshake:(?:proxy_authentication_required|proxy_authentication_failed|proxy_http_407'
     r'|not_socks5|invalid_socks5_address|socks4_reply_92|socks4_reply_93|socks5_reply_7|socks5_reply_8))'
 )
+_CONNECTION_ERROR = re.compile(CONNECTION_ERROR_PATTERN)
 
 
 def proxy_connection_error(error):
-    return error if error is not None and re.fullmatch(CONNECTION_ERROR_PATTERN, error) else None
+    return error if error is not None and _CONNECTION_ERROR.fullmatch(error) else None
 
 
 def website_prefix(website):

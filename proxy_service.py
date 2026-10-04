@@ -1,12 +1,13 @@
 """Continuously synchronize the catalog, test proxies, and publish a ranked pool."""
 import argparse
 import asyncio
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import signal
@@ -14,6 +15,8 @@ import shutil
 import threading
 import time
 import uuid
+
+import psycopg
 
 from catalog_sync import DEFAULT_REPOSITORY, synchronize, validate_repository
 from collect_video_metadata import CLIENT_VERSION, fetch_metadata
@@ -32,7 +35,7 @@ def automatic_concurrency():
             cpus = min(cpus, max(1, math.ceil(int(maximum) / int(period))))
     memory = available_memory()
     # Reserve most memory for PostgreSQL, TLS, the OS, and other application work.
-    return max(64, min(80000, cpus * 2048, int(memory * 0.15) // (128 * 1024)))
+    return max(64, min(cpus * 6144, int(memory * 0.30) // (96 * 1024)))
 
 
 @dataclass(frozen=True)
@@ -51,23 +54,30 @@ class Settings:
     connect_timeout: int = 3
     request_timeout: int = 10
     import_workers: int = 4
+    test_workers: int = 2
 
     @classmethod
     def environment(cls):
-        values = {"repository": os.environ.get("MEDIA_PROXY_REPOSITORY", DEFAULT_REPOSITORY)}
+        cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 2
+        values = {"repository": os.environ.get("MEDIA_PROXY_REPOSITORY", DEFAULT_REPOSITORY),
+                  "import_workers": max(1, min(8, cpus // 6)),
+                  "test_workers": max(1, min(4, cpus // 12))}
         names = {"sync_interval": "SYNC_INTERVAL", "retest_interval": "RETEST_INTERVAL",
                  "test_concurrency": "TEST_CONCURRENCY", "batch_size": "TEST_BATCH_SIZE",
                  "quality_sample": "QUALITY_SAMPLE", "quality_concurrency": "QUALITY_CONCURRENCY",
                  "quality_interval": "QUALITY_INTERVAL", "journal_retention": "JOURNAL_RETENTION",
-                 "import_workers": "IMPORT_WORKERS"}
+                 "import_workers": "IMPORT_WORKERS", "test_workers": "TEST_WORKERS"}
         for field, name in names.items():
             if "MEDIA_PROXY_" + name in os.environ:
-                values[field] = int(os.environ["MEDIA_PROXY_" + name])
+                value = int(os.environ["MEDIA_PROXY_" + name])
+                if value or field not in ("import_workers", "test_workers"):
+                    values[field] = value
         result = cls(**values)
         validate_repository(result.repository)
         if (result.sync_interval < 1 or result.retest_interval < 1 or result.quality_interval < 1
                 or result.test_concurrency < 0 or result.batch_size < 0 or result.quality_sample < 0
-                or result.quality_concurrency < 1 or result.journal_retention < 1 or result.import_workers < 1):
+                or result.quality_concurrency < 1 or result.journal_retention < 1 or result.import_workers < 1
+                or result.test_workers < 1):
             raise ValueError("Proxy service settings must be positive; zero selects automatic test sizing")
         concurrency = result.test_concurrency or automatic_concurrency()
         return replace(result, test_concurrency=concurrency, batch_size=result.batch_size or min(1000000, concurrency * 16))
@@ -131,8 +141,15 @@ def prepare_batch(home, settings, *, after_id=None, max_id=None, round_id=None, 
     return current
 
 
+def import_batch_results(parameters, journal, retest_seconds, round_id, pass_number, parallel):
+    with psycopg.connect(**parameters, autocommit=True) as conn:
+        conn.execute("SET temp_buffers = '128MB'")
+        return import_test_journal(conn, journal, retest_seconds=retest_seconds,
+                                   round_id=round_id, pass_number=pass_number, parallel=parallel)
+
+
 def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False,
-               round_id=None, pass_number=None, test_lock=None, parallel_import=False):
+               round_id=None, pass_number=None, test_lock=None, parallel_import=False, importer=None):
     started = time.monotonic()
     home = Path(home)
     checkpoint = home / "current-test.json"
@@ -148,16 +165,20 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
     concurrency = min(settings.test_concurrency, current.get("concurrency", settings.test_concurrency))
     status.update(state="testing", run_id=current["run_id"], concurrency=concurrency)
     if current["phase"] == "testing":
-        event("proxy_test_started", run_id=current["run_id"], concurrency=concurrency,
-              selected=read_json(manifest)["records"])
         with test_lock or nullcontext(), (folder / "tester.log").open("a") as log:
             if stop.is_set():
                 raise InterruptedError("Prepared test batch retained for restart")
+            event("proxy_test_started", run_id=current["run_id"], concurrency=concurrency,
+                  selected=read_json(manifest)["records"])
+            environment = os.environ.copy()
+            if parallel_import:
+                cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 2
+                environment.setdefault("GOMAXPROCS", str(max(1, cpus // settings.test_workers)))
             code = run_owned([str(BRIDGE_BINARY), "--input", str(manifest), "--output", str(journal),
                 "--run-id", current["run_id"], "--concurrency", str(concurrency),
                 "--connect-timeout", f"{saved.connect_timeout}s", "--total-timeout", f"{saved.request_timeout}s",
                 "--video-id", saved.video_id, "--client-version", saved.client_version],
-                stop=stop, stdout=log, stderr=log)
+                stop=stop, stdout=log, stderr=log, env=environment)
         summary = read_json(Path(str(journal) + ".summary.json"), {})
         if summary.get("state") == "local_overload":
             current["concurrency"] = max(1, concurrency // 2)
@@ -174,12 +195,25 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
         raise InterruptedError("Test results are saved for import on restart")
     if digest(journal) != current["journal_sha256"]:
         raise ValueError("Stopped test journal changed")
+    completed = read_json(folder / "completed.json")
+    if completed is not None:
+        # The journal hash and pass binding were verified above. This marker is
+        # written only after the atomic database import has committed.
+        if not retain_checkpoint:
+            checkpoint.unlink()
+        return {**completed, "already_imported": True}
     tested = time.monotonic()
     status.update(state="importing_tests")
     with connect_database("proxy", autocommit=True) as conn:
-        conn.execute("SET temp_buffers = '128MB'")
-        report = import_test_journal(conn, journal, retest_seconds=settings.retest_interval,
-                                     round_id=round_id, pass_number=pass_number, parallel=parallel_import)
+        if importer is None:
+            conn.execute("SET temp_buffers = '128MB'")
+            report = import_test_journal(conn, journal, retest_seconds=settings.retest_interval,
+                                         round_id=round_id, pass_number=pass_number, parallel=parallel_import)
+        else:
+            parameters = conn.info.get_parameters()
+    if importer is not None:
+        report = importer.submit(import_batch_results, parameters, journal, settings.retest_interval,
+                                 round_id, pass_number, parallel_import).result()
     report["seconds"] = {"prepare": round(exported-started, 2), "test": round(tested-exported, 2),
                          "import": round(time.monotonic()-tested, 2), "total": round(time.monotonic()-started, 2)}
     write_json(folder / "completed.json", {**report, "completed_at": utcnow().isoformat()})
@@ -191,7 +225,7 @@ def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, reta
 
 
 def refresh_batches(home, batch_home, current, settings, stop, status, owner):
-    """Overlap export, one network tester, and imports of disjoint proxy ranges.
+    """Overlap export, network testers, and imports of disjoint proxy ranges.
 
     Each range has its own durable checkpoint. Only a committed prefix advances
     the run cursor, so a restart replays completed imports without retesting.
@@ -201,8 +235,12 @@ def refresh_batches(home, batch_home, current, settings, stop, status, owner):
     saved = read_json(legacy)
     if saved and saved["run_id"] == current["last_batch"]:
         legacy.unlink()
-    test_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=settings.import_workers, thread_name_prefix="proxy-batch") as workers:
+    test_workers = min(settings.test_workers, settings.test_concurrency)
+    test_lock = threading.BoundedSemaphore(test_workers)
+    worker_settings = replace(settings, test_concurrency=max(1, settings.test_concurrency // test_workers))
+    capacity = settings.import_workers + test_workers
+    with ProcessPoolExecutor(max_workers=settings.import_workers, mp_context=multiprocessing.get_context("spawn")) as importer, \
+            ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="proxy-batch") as workers:
         try:
             while current["pass"] <= 3:
                 pass_number = current["pass"]
@@ -211,7 +249,7 @@ def refresh_batches(home, batch_home, current, settings, stop, status, owner):
                     if stop.is_set():
                         raise InterruptedError("Pipeline checkpoints saved; invoke the command to resume")
                     owner.execute("SELECT 1")
-                    while not exhausted and len(pending) < settings.import_workers:
+                    while not exhausted and len(pending) < capacity:
                         folder = batch_home if legacy.exists() and cursor == current["after_id"] else (
                             batch_home / "batches" / f"{pass_number}-{cursor}")
                         started = time.monotonic()
@@ -220,10 +258,10 @@ def refresh_batches(home, batch_home, current, settings, stop, status, owner):
                         if prepared is None:
                             exhausted = True
                             break
-                        future = workers.submit(test_batch, folder, settings, stop, status,
+                        future = workers.submit(test_batch, folder, worker_settings, stop, status,
                             after_id=cursor, max_id=current["max_id"], retain_checkpoint=True,
                             round_id=current["run_id"], pass_number=pass_number,
-                            test_lock=test_lock, parallel_import=True)
+                            test_lock=test_lock, parallel_import=True, importer=importer)
                         pending.append({"folder": folder, "saved": prepared, "future": future,
                                         "prepare_seconds": round(time.monotonic()-started, 2)})
                         cursor = prepared["last_proxy_id"]
@@ -245,7 +283,8 @@ def refresh_batches(home, batch_home, current, settings, stop, status, owner):
                         configurations=current["configurations"], observations=current["observations"],
                         pipeline=[{"run_id": item["saved"]["run_id"], "home": str(item["folder"]),
                                    "done": item["future"].done()} for item in pending],
-                        import_workers=settings.import_workers, concurrency=settings.test_concurrency)
+                        import_workers=settings.import_workers, test_workers=test_workers,
+                        concurrency=settings.test_concurrency)
                     if pending:
                         unfinished = [item["future"] for item in pending if not item["future"].done()]
                         if unfinished:
