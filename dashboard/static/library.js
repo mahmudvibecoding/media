@@ -49,7 +49,7 @@
   document.addEventListener('htmx:beforeSwap', event => {
     const status = event.detail.xhr.status;
     if ([400,404,503].includes(status)) {
-      if (event.detail.target.id === 'detail-layer') {
+      if (event.detail.target?.id === 'detail-layer') {
         notice(status === 503 ? 'The library is temporarily unavailable. Please try again.' : 'This record or page could not be opened. Refresh and try again.');
       } else {
         event.detail.shouldSwap = true;
@@ -60,7 +60,7 @@
   document.addEventListener('htmx:afterSwap', event => {
     initialize();
     if (!document.getElementById('record-drawer') && lastRecord?.isConnected) lastRecord.focus({preventScroll:true});
-    if (event.detail.target.id === 'workspace') window.scrollTo({top:0,behavior:'instant'});
+    if (event.detail.target?.id === 'workspace') window.scrollTo({top:0,behavior:'instant'});
   });
   document.addEventListener('htmx:historyRestore', initialize);
   document.addEventListener('htmx:sendError', () => notice('Connection interrupted. Please try again.'));
