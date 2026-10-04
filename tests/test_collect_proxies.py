@@ -14,6 +14,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from collect_proxies import Downloader, Store, connection, now, stored_settings, format_hint_for_url
+from database_helpers import connect_test_database
 
 
 def args(**overrides):
@@ -144,8 +145,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
         from psycopg.rows import dict_row
-        from collect_proxies import DB
-        self.conn = psycopg.connect(**DB, row_factory=dict_row)
+        self.conn = connect_test_database("proxy", row_factory=dict_row)
         schema = 'test_proxy_' + uuid.uuid4().hex
         self.conn.execute('CREATE SCHEMA ' + schema)
         self.conn.execute('SET LOCAL search_path TO ' + schema + ',public')

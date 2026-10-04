@@ -263,10 +263,8 @@ class DiscoveryDatabaseTests(unittest.TestCase):
         transaction = self.conn.transaction(force_rollback=True)
         transaction.__enter__()
         self.addCleanup(transaction.__exit__, None, None, None)
-        row = self.conn.execute("SELECT channel_id FROM public.channels ORDER BY channel_id LIMIT 1").fetchone()
-        if row is None:
-            self.skipTest("Database needs at least one channel")
-        self.channel = row[0]
+        self.channel = "UC" + uuid.uuid4().hex[:22]
+        self.conn.execute("INSERT INTO public.channels(channel_id) VALUES (%s)", (self.channel,))
         self.ids = [uuid.uuid4().hex[:11] for _ in range(3)]
 
     def result(self, ids, video_type="video"):

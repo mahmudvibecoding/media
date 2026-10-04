@@ -1,7 +1,8 @@
 # YouTube collection and proxy catalog
 
 Collect channel subscriber counts, discover videos and Shorts, and save video
-metadata through direct requests or saved proxy configurations. The proxy catalog
+metadata, view and like counts, and public top-level comments. Collectors use
+direct requests or saved proxy configurations. The proxy catalog
 stores public source lists, connection settings, and compact website statistics.
 YouTube collectors use raw InnerTube HTTP requests.
 
@@ -41,14 +42,13 @@ The `videos` table has `video_id` as its primary key, a `channel_id` foreign key
 `type` constrained to `video` or `short`, and nullable `published_at TIMESTAMPTZ`.
 It is indexed by `(channel_id, type)`.
 
-For an existing channels-only database, apply these migrations once. If `videos`
-already exists, apply only `003_channel_scan_state.sql`:
+For an existing channels-only database, create `videos` once:
 
 ```sh
 /opt/homebrew/opt/postgresql@18/bin/psql -X \
   -h "$PWD/.local/postgres/socket" -U mahmud -d media \
   -v ON_ERROR_STOP=1 --single-transaction \
-  -f db/migrations/002_videos.sql -f db/migrations/003_channel_scan_state.sql
+  -f db/migrations/002_videos.sql
 ```
 
 Discover and save uploads for 100 channels, ordered by channel ID:
@@ -63,34 +63,29 @@ Fetch and save one existing channel:
 .venv/bin/python discover_videos.py --channel-id UCVPst_iSyaVYpuOP4ogRhlw
 ```
 
-Resume an unfinished initial scan, skipping every tab already initialized:
+Check all channels for new uploads:
 
 ```sh
-.venv/bin/python discover_videos.py --limit 55239 --initial-only --concurrency 16
+.venv/bin/python discover_videos.py --limit 55239 --concurrency 16
 ```
 
-Omit `--initial-only` for later monitoring runs, which must check initialized tabs
-for new uploads. This option uses the existing initialization markers and sends
-no requests for completed tabs.
-
-The initial scan saves one page per tab to `videos`, including uploads that
-existed before collection started. Later scans follow continuation tokens until
+Every scan starts with the latest uploads and follows continuation tokens until
 the last ID on a fully processed page was already stored for that channel and
-type, or the tab ends. A known ID near the start of a page does not stop the scan.
+type, or the tab ends. A first scan with no saved IDs follows the available
+history to the end, subject to `--max-pages`. A known ID near the start of a page
+does not stop the scan. Empty and absent tabs are checked again on later runs.
 Each completed tab scan uses one batch insert with
 `ON CONFLICT (video_id) DO NOTHING RETURNING video_id`. Existing rows are preserved,
 and PostgreSQL returns only newly inserted IDs. No separate seen-ID table is used.
 `published_at` is left NULL for new rows until metadata is collected.
 
-`channel_scan_state` stores one `(channel_id, type)` initialization marker for
-each successfully checked tab, including empty or absent tabs. This lets a
-previously empty tab collect multiple pages when uploads appear. The migration
-initializes markers for existing videos; the local database also preserves the
-25 absent tabs from the previously verified 100-channel run.
+Existing databases should apply `db/migrations/010_drop_channel_scan_state.sql`
+to remove the old initialization markers. The `--initial-only` option has been
+removed; rerun the normal command to check the selected channels.
 
-Pages are buffered in memory until a tab scan finishes. The new IDs and its
-initialization marker commit in one short transaction, with no transaction held
-during network requests. Failed or interrupted scans save no partial IDs. A new
+Pages are buffered in memory until a tab scan finishes. The new IDs commit in
+one short transaction, with no transaction held during network requests.
+Failed or interrupted scans save no partial IDs. A new
 invocation restarts from the first page using fresh continuation tokens; buffered
 IDs from the failed attempt cannot falsely stop the retry.
 
@@ -122,6 +117,191 @@ The API and response shapes are internal and may change.
 Options: `--concurrency` (default 4), `--retries` (default 2), `--max-pages` (default 100), `--output` (a new
 directory), and the environment variables listed below. Byte counters cover HTTP
 bodies only, including retry attempts, and exclude headers and connection overhead.
+
+## Video statistics columns
+
+After migrations `001` through `008`, apply `009` once to add nullable
+`view_count BIGINT`, `like_count BIGINT`, `stats_updated_at TIMESTAMPTZ`, and
+`stats_error TEXT` to `public.videos`:
+
+```sh
+/opt/homebrew/opt/postgresql@18/bin/psql -X \
+  -h "$PWD/.local/postgres/socket" -U mahmud -d media \
+  -v ON_ERROR_STOP=1 --single-transaction \
+  -f db/migrations/009_video_stats.sql
+```
+
+Both counts reject negative values and start as `NULL`, including for existing
+videos. The statistics timestamp tracks freshness separately from metadata.
+The migration leaves them empty until the [statistics collector](#collect-views-and-likes)
+runs. See [the write rules](db/README.md#videos).
+
+## Comment storage
+
+After migration `010`, apply `011` once to add `public.comments` and the nullable
+`comments_updated_at` and `comments_error` columns on `public.videos`:
+
+```sh
+/opt/homebrew/opt/postgresql@18/bin/psql -X \
+  -h "$PWD/.local/postgres/socket" -U mahmud -d media \
+  -v ON_ERROR_STOP=1 --single-transaction \
+  -f db/migrations/011_video_comments.sql
+```
+
+Each comment stores `video_id`, `comment_id`, `text`, `author_channel_id`,
+`author_name`, and `is_pinned`. The primary key is `(video_id, comment_id)`, and
+the video must already exist. Replies, comment likes, publication dates, and
+collection timestamps are excluded. Author fields and pinned status can be NULL.
+
+`comments_updated_at` records a completed scan only after all of its pages have
+been imported; `comments_error` records the latest failure. Both start as NULL.
+The schema includes an index for videos whose first successful comment scan is
+still pending. Resume tokens and scan boundaries belong in the durable worker
+queue.
+
+See [the database guide](db/README.md#comments) for permissions and write rules.
+
+### Collect one video's comments
+
+```sh
+.venv/bin/python collect_video_comments.py ymjtt5KJiR4
+```
+
+The video must exist in `public.videos`. The collector requests Newest directly
+through `/next`, verifies the returned sort, and consumes that first response as
+page one. It follows only top-level comment pages. A repeat scan processes the
+whole page containing a saved, non-pinned comment before stopping. Currently
+pinned, previously pinned, and unknown-pin comments cannot end that scan.
+Comments revisited during the scan have their text, author, and pinned status
+refreshed. Older comments outside that range are left as saved.
+
+A temporary SQLite file holds new pages and a fixed copy of the prior completed
+history. On success, all comments and `videos.comments_updated_at` are committed
+together. Failures preserve saved comments and the previous successful timestamp,
+and set `comments_error`. Retrying starts from the first page; partial scans
+cannot create a false stopping point. Empty and disabled comment sections finish
+successfully; unavailable videos and unrecognized responses record an error.
+
+Options: `--max-pages` (default 10,000), `--retries` (default 2), `--timeout`
+(seconds per request attempt, default 30), `--client-version`, and `--output`.
+Reaching the page limit is an incomplete scan. Increase it and rerun when needed.
+`MEDIA_DATABASE_URL` and `MEDIA_PROXY_URL` use the same conventions as the other
+single collectors. Concurrent runs for the same video are prevented by a
+PostgreSQL advisory lock. Each run writes an operational `summary.json` under
+`outputs/comments-<video>-<timestamp>/`; comment rows go into PostgreSQL.
+
+Incremental scans do not discover every edit or comment made visible later below
+the saved-history boundary.
+
+### Collect a snapshot of videos
+
+`comments_bulk.py` freezes video IDs and completed comment history, stores each
+validated page with its next token in SQLite, and publishes checksummed gzip
+batches. `comments_bulk_import.py` imports each successful video's complete scan
+in one PostgreSQL transaction. Failed scans retain their partial pages in the
+queue and update only `comments_error` in PostgreSQL.
+
+```sh
+.venv/bin/python comments_bulk.py export --output outputs/comments-run \
+  --ranked path/to/ranked-responders.jsonl --limit 1000 --proxy-limit 512
+.venv/bin/python comments_bulk.py init --run outputs/comments-run \
+  --concurrency 64 --max-attempts 6 --max-pages 10000 --timeout 20
+.venv/bin/python comments_bulk.py run --run outputs/comments-run
+.venv/bin/python comments_bulk_import.py --run outputs/comments-run
+```
+
+The ranked file contains `proxy_id` values from the existing proxy tests. Export
+loads their configurations from the local proxy database. The default selection
+is a deterministic 1,000-video sample; `--limit 0` explicitly selects all videos.
+`--include VIDEO_ID` adds a control video within the limit. Snapshot files contain
+private proxy configurations; keep the run folder private.
+
+To update the same videos later, export a new folder with
+`--from-run outputs/comments-run`, then initialize, run, and import that folder.
+The new export reads the latest completed history from PostgreSQL. Reusing the
+old folder resumes its existing scan instead of starting a new update.
+
+- **Status:** `comments_bulk.py status --run RUN`. A `complete` worker has no
+  pending jobs; inspect both `completed` and `failed` counts.
+- **Pause:** send SIGINT/SIGTERM to the worker or set `stop` to `true` in its
+  `control.json`. Resume with the same `run --run RUN` command. It continues from
+  saved pages without an extra pass at the newest comments after resuming.
+- **Retry failures:** `comments_bulk.py retry --run RUN`, then run and import
+  again. The original saved-history boundary remains fixed. Failed artifacts
+  stay immutable, and the retry gets a new scan identity. A scan with no saved
+  pages restarts its initial request; other scans keep their saved continuation.
+  Add `--recoverable-only` to skip videos already confirmed unavailable, or
+  `--video-id VIDEO_ID` to retry one failed video.
+- **Live import:** add `--watch` to the importer. For a worker on another host,
+  retain the original snapshot locally and add `--host USER@HOST --remote RUN`.
+  The importer copies only published outbox files and worker status.
+
+The runner uses the existing recent-performance proxy pool, with one active
+request per proxy. Limits apply to each unfinished page. Expired continuations
+may restart from Newest using the original boundary and deduplicated buffer.
+Reaching `--max-pages` leaves a scan incomplete. Proxy attempt statistics are
+imported separately with replay protection.
+
+Preserve `queue.sqlite3`, `import.sqlite3`, the snapshot, and the outbox together.
+The importer verifies file checksums and all six comment fields before writing.
+Its durable receipts recover a PostgreSQL commit whose acknowledgement was lost;
+replaying a scan changes neither rows nor its completion timestamp. Older
+snapshots cannot overwrite a newer completed scan.
+
+See [the collection design](docs/comment-collection-plan.md) and the pilot evidence
+under `outputs/comments-pilot-20261003/`.
+
+### Run independent comment queues in parallel
+
+`comments_bulk_fleet.py` partitions one frozen snapshot into disjoint video and
+proxy sets. It preserves each video's frozen history and distributes proxy ranks
+across the queues. Collectors keep separate SQLite journals, so they can write
+checkpoints in parallel. The importer still commits complete videos atomically.
+Each collector performs its queue reads, writes, and exports on one storage
+thread so disk checkpoints can run while the network loop handles responses.
+Checkpoints share durable transactions, and imports group up to 64 distinct
+videos per transaction. Prepared import receipts reach disk before PostgreSQL
+commits; receipts are acknowledged only after that commit succeeds.
+
+```sh
+.venv/bin/python comments_bulk_fleet.py partition --source SNAPSHOT \
+  --output FLEET --shards 16 --concurrency 512
+.venv/bin/python comments_bulk_fleet.py collect --fleet FLEET
+.venv/bin/python comments_bulk_fleet.py import --fleet LOCAL_FLEET \
+  --host USER@HOST --remote REMOTE_FLEET
+.venv/bin/python comments_bulk_fleet.py status --fleet LOCAL_FLEET
+```
+
+Copy the partitioned snapshot to the collection host before starting either
+supervisor. The collection supervisor initializes new queues and resumes existing
+ones; the import supervisor continuously retrieves and imports published batches.
+Both record child process failures and restart interrupted children up to three
+times. Send SIGTERM to a supervisor to stop its children gracefully.
+
+Use `comments_bulk_fleet.py control --fleet FLEET --concurrency 1024` on the
+collection host to change requests per queue. Each queue supports up to 1,024
+concurrent requests. Add `--stop` to pause collectors. An ordinary resume
+continues saved pages without an extra pass at the newest comments.
+
+The full run started on October 3, 2026 uses local artifacts in
+`outputs/comments-full-20261003/` and remote queues in
+`/opt/media-comments/runs/20261003-all/` on the user's collection server.
+Its live service is `media-comments-20261003.service`. Status files distinguish
+buffered comments, completed scans, and comments committed to PostgreSQL.
+
+After collection and imports finish, export the independent audit on the
+collection host, copy its output locally, then compare it with PostgreSQL:
+
+```sh
+.venv/bin/python comments_bulk_audit.py export --fleet FLEET --output AUDIT
+.venv/bin/python comments_bulk_audit.py validate --fleet LOCAL_FLEET \
+  --expected LOCAL_AUDIT --output verification.json
+```
+
+The audit compares every selected video's row count, content hashes, completion
+receipt, and error state. It also checks all revisited comment fields and
+preserves the original saved history. A passing audit confirms that imports
+match the queues; `source_counts.failed` still reports incomplete videos.
 
 ## Collect video metadata
 
@@ -272,19 +452,34 @@ Initialize and start from the server's checkout:
 The concurrency argument is per worker: these defaults allow 1,024 simultaneous
 requests. Each proxy belongs to one worker and has at most one active request.
 Workers first try their unused configurations, then prefer successful ones.
-When both groups are ready, 95% of selections go to configurations that have
-returned metadata and 5% recheck the others. Repeated failures postpone a
-configuration's next eligibility; successes make it eligible immediately.
+Eligible configurations are ranked by recent request success divided by average
+successful response time. After the first scored result, each new result has 20%
+weight; older results gradually lose influence. One selection in twenty checks
+the longest-waiting eligible configuration, so slower or previously unsuccessful
+proxies can recover.
+Temporary connection, HTTP and invalid-response failures lower the score and
+postpone reuse for 2, 4, 8, 16, 32, then at most 60 seconds. Successful requests
+make the configuration eligible immediately. Local worker errors do not lower
+proxy scores.
+Recent scores, response times and cooldowns are committed with results in the
+run's SQLite queue and restored after worker restarts. Scores older than one hour
+are reset. Existing queues gain these tables when resumed; previous journals are
+preserved. A new run learns its own scores from its selected proxy snapshot.
 Connection setup has a five-second timeout; the entire request has a twenty-second
 deadline. Idle reusable connections are kept for up to two minutes. There are no
 retries inside an individual request.
 
 Videos without previous errors come first. Failed videos enter a recovery round
-after the initial queue finishes. Recovery uses configurations that returned
-metadata when that worker has any. It avoids the previous proxy when another is
-available. Each video gets up to the configured number of network attempts; local
-worker failures do not affect proxy statistics. Five local failures leave a final
-video error so the queue cannot loop indefinitely.
+after the initial queue finishes. Recovery prefers available scored configurations
+and avoids the previous proxy when another is available. Each video gets up to
+the configured number of network attempts. Matching video-unavailability evidence
+from two different proxy configurations within an hour ends retries for that video
+in the current run. Repeating the error through the same proxy does not confirm it.
+HTTP errors, bot challenges and malformed responses retain their retry budget.
+Valid video errors are recorded separately and excluded from proxy success scores;
+the request and connection counters still record what happened. Local worker
+failures do not affect proxy statistics. Five local failures leave a final video
+error so the queue cannot loop indefinitely.
 
 Run the importer on the computer holding PostgreSQL. Use the `run_id` from the
 snapshot's `manifest.json`:
@@ -495,24 +690,80 @@ Optional environment variables:
 
 ## Check the worker
 
-The full Python suite is invoked with:
+For a fresh clone, install the Python dependencies above, Go 1.26, PostgreSQL 18
+server tools, and OpenSSL. Run as a normal user on macOS or Linux:
+
+```sh
+.venv/bin/python scripts/check_backend.py
+```
+
+The command locates PostgreSQL through `pg_config`, runs the Go tests with the
+race detector, builds the transport bridge, and runs every Python test against
+new `media` and `proxy` databases in a private temporary cluster. It stops and
+removes that cluster afterward. Existing databases and collection jobs are not
+used. HTTP fixtures run locally; dependency installation may require network access.
+
+If the PostgreSQL tools are outside `PATH`, provide their directory:
+
+```sh
+.venv/bin/python scripts/check_backend.py \
+  --postgres-bin /opt/homebrew/opt/postgresql@18/bin
+```
+
+For a quicker Python run, invoke:
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
+That command skips database tests unless their opt-in environment variables are
+set, and skips bridge process tests unless `.local/bin/proxy-tester` exists.
 The proxy tests cover transport identity, migration preservation, shared protocol
-selection, website error separation and statistics replay. To include their
-database checks in isolated schemas with rollback:
+selection, website error separation and statistics replay. To supply an existing
+disposable test database explicitly:
 
 ```sh
-PROXY_TEST_DATABASE=1 .venv/bin/python -m unittest discover -s tests -p '*prox*.py'
+PROXY_TEST_DATABASE=1 \
+PROXY_TEST_DATABASE_URL="host=/path/to/test/socket dbname=proxy user=test_user" \
+  .venv/bin/python -m unittest discover -s tests -p '*prox*.py'
 ```
 
 To include database insertion tests, supply a test connection. These tests use
 transactions that roll back their rows:
 
 ```sh
-MEDIA_TEST_DATABASE_URL="dbname=media user=mahmud host=$PWD/.local/postgres/socket" \
+MEDIA_TEST_DATABASE_URL="host=/path/to/test/socket dbname=media user=test_user" \
   .venv/bin/python -m unittest discover -s tests -v
+```
+
+## Collect views and likes
+
+`collect_video_stats.py` requests the primary video's counts through `/youtubei/v1/next`.
+It verifies the returned video ID, uses exact view and like labels, and rejects
+rounded labels and live viewer counts. Missing counts remain NULL. Each saved
+result retains the source labels so the importer can check the parsed numbers.
+
+`video_stats_bulk.py export --output RUN --ranked RANKED_RESULTS` freezes the video
+IDs and a ranked proxy selection. Add `--limit 10000` for a distributed pilot or
+`--missing-only` to select videos with either count missing. Initialize the copied
+snapshot with `video_stats_bulk.py init --run RUN --workers 32 --concurrency 512
+--max-attempts 5`, then use `metadata_bulk.py run --run RUN`. The manifest selects
+the statistics collector. The existing queue, committed result batches, recovery,
+and proxy connection reuse also apply to statistics runs.
+The same two-proxy confirmation applies when an identity-checked response exposes
+neither count. Partial results are saved immediately. Statistics collection uses
+`/next`; the bulk worker does not call `/player`.
+
+On the database machine, `video_stats_bulk_import.py` accepts `--host`, `--remote`,
+`--local`, and the manifest's `--run-id`. It validates file hashes, sequence numbers,
+video identities, source counts, and proxy observations before importing. Repeating
+the same batch does not increase counters again. Newer partial observations retain
+previously collected counts and record the missing fields in `stats_error`.
+
+Results are stored in `media.public.videos`: `view_count`, `like_count`,
+`stats_updated_at`, and `stats_error`. Metadata fields are preserved. Statistics
+tests, including temporary database tables, run with:
+
+```sh
+PROXY_TEST_DATABASE=1 .venv/bin/python -m unittest discover -s tests -p 'test_video_stats.py' -v
 ```

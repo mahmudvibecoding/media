@@ -1,7 +1,7 @@
 """Discover Videos and Shorts through the previously stored range.
 
-The initial scan saves one page. Later scans follow pagination as needed and
-commit a complete tab scan atomically. Failed scans can restart from page one.
+Every scan follows pagination until a known range or the end of the tab, then
+commits its new IDs atomically. Failed scans can restart from page one.
 Publication times and recurring polling are separate steps.
 """
 
@@ -298,16 +298,8 @@ def select_channels(args):
         )]
 
 
-def select_tabs(channels, *, initial_only=False):
-    jobs = [(channel_id, video_type) for channel_id in channels for video_type in TABS]
-    if initial_only and channels:
-        with open_database() as conn:
-            initialized = set(conn.execute(
-                "SELECT channel_id,type FROM public.channel_scan_state WHERE channel_id=ANY(%s)",
-                (channels,),
-            ))
-        jobs = [job for job in jobs if job not in initialized]
-    return jobs
+def select_tabs(channels):
+    return [(channel_id, video_type) for channel_id in channels for video_type in TABS]
 
 
 def save_videos(conn, result):
@@ -331,17 +323,13 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
     result = {
         "channel_id": channel_id, "type": video_type, "status": "error", "videos": [],
         "continuation": None, "latest_verified": False, "complete_tab": False,
-        "scan_complete": False, "stop_reason": None, "initialized_before": False,
+        "scan_complete": False, "stop_reason": None,
         "attempts": 0, "request_body_bytes": 0, "response_body_bytes": 0, "decoded_body_bytes": 0,
         "pages_fetched": 0, "pages": [], "inserted_video_ids": [],
         "videos_inserted": 0, "videos_already_present": 0,
     }
     started = time.monotonic()
     try:
-        result["initialized_before"] = conn.execute(
-            "SELECT EXISTS (SELECT 1 FROM public.channel_scan_state WHERE channel_id=%s AND type=%s)",
-            (channel_id, video_type),
-        ).fetchone()[0]
         buffered, seen_tokens, seen_pages = {}, set(), set()
         continuation = None
         for page_number in range(1, max_pages + 1):
@@ -383,9 +371,7 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
 
             # Process the entire page. A known item at its start is insufficient:
             # new items can still follow it, including on the next page.
-            if not result["initialized_before"]:
-                result["stop_reason"] = "initial_page"
-            elif page["continuation"] is None:
+            if page["continuation"] is None:
                 result["stop_reason"] = "end_of_tab"
             elif ids and ids[-1] in known:
                 result["stop_reason"] = "known_range"
@@ -404,16 +390,10 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
             result.update(status="page_limit", error=f"Scan needs more than {max_pages} pages; nothing saved")
             return result
 
-        # No transaction is held during HTTP requests. IDs and the first-scan
-        # marker commit together, or both roll back if either database write fails.
+        # No transaction is held during HTTP requests. Commit the entire tab's
+        # new IDs together so a failed scan cannot leave a false stopping point.
         with conn.transaction():
             inserted = save_videos(conn, result)
-            if not result["initialized_before"]:
-                conn.execute(
-                    """INSERT INTO public.channel_scan_state (channel_id, type) VALUES (%s,%s)
-                       ON CONFLICT (channel_id, type) DO NOTHING""",
-                    (channel_id, video_type),
-                )
         result.update(inserted_video_ids=inserted, videos_inserted=len(inserted),
                       videos_already_present=len(result["videos"]) - len(inserted), scan_complete=True)
     except psycopg.Error as exc:
@@ -425,7 +405,7 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
 
 async def collect(args):
     channels = select_channels(args)
-    selected_tabs = select_tabs(channels, initial_only=args.initial_only)
+    selected_tabs = select_tabs(channels)
     selected_channels = len({channel_id for channel_id, _ in selected_tabs})
     out = args.output or ROOT / "outputs" / (
         "discovery-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -433,8 +413,7 @@ async def collect(args):
     out.mkdir(parents=True, exist_ok=False)
     summary = {
         "started_at": datetime.now(timezone.utc).isoformat(), "channels_selected": selected_channels,
-        "channels_considered": len(channels), "initial_only": args.initial_only,
-        "tabs_skipped_initialized": 2 * len(channels) - len(selected_tabs),
+        "channels_considered": len(channels),
         "tabs_planned": len(selected_tabs), "tabs_completed": 0, "video_ids_returned": 0,
         "scans_completed": 0, "pages_fetched": 0, "max_pages_per_tab": args.max_pages,
         "http_attempts": 0, "request_body_bytes": 0, "response_body_bytes": 0,
@@ -443,7 +422,7 @@ async def collect(args):
         "complete_tabs_without_sort": 0,
         "stopped_reason": None, "videos_inserted": 0, "videos_already_present": 0,
         "output_directory": str(out.resolve()),
-        "scope": "Initial scan saves one page; subsequent scans paginate through the stored range",
+        "scope": "Every scan paginates through the stored range or to the end of the tab",
         "traffic_scope": "HTTP bodies only; excludes headers, TLS and TCP/IP overhead",
         "request_byte_scope": "Constructed request bodies for all attempts, including transport failures",
     }
@@ -524,8 +503,6 @@ def main():
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--limit", type=positive_int, default=100)
     selection.add_argument("--channel-id", action="append", help="An existing channel ID; repeat for more")
-    parser.add_argument("--initial-only", action="store_true",
-                        help="Skip completed initial tab scans; resume an unfinished baseline")
     parser.add_argument("--concurrency", type=positive_int, default=4)
     parser.add_argument("--retries", type=int, choices=range(4), default=2)
     parser.add_argument("--max-pages", type=positive_int, default=100,

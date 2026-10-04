@@ -11,7 +11,7 @@ import uuid
 
 import psycopg
 from psycopg.types.json import Jsonb
-from collect_proxies import DB
+from database_helpers import connect_test_database
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('proxy_importer',ROOT/'proxy-tester/import_results.py')
@@ -58,7 +58,7 @@ def ddl(conn, schema, text):
 @unittest.skipUnless(os.environ.get('PROXY_TEST_DATABASE') == '1','Opt in to rollback-only integration tests')
 class CompactionTests(unittest.TestCase):
     def setUp(self):
-        self.conn = psycopg.connect(**DB)
+        self.conn = connect_test_database("proxy")
         self.schema = 'test_compact_' + uuid.uuid4().hex
         self.conn.execute('CREATE SCHEMA ' + self.schema)
         self.conn.execute('SET LOCAL search_path TO ' + self.schema + ',public')

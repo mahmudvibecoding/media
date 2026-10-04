@@ -13,15 +13,27 @@ CREATE TABLE public.videos (
     duration_seconds INTEGER CHECK (duration_seconds >= 0),
     thumbnail_url TEXT,
     metadata_updated_at TIMESTAMPTZ,
-    metadata_error TEXT
+    metadata_error TEXT,
+    view_count BIGINT CHECK (view_count >= 0),
+    like_count BIGINT CHECK (like_count >= 0),
+    stats_updated_at TIMESTAMPTZ,
+    stats_error TEXT,
+    comments_updated_at TIMESTAMPTZ,
+    comments_error TEXT
 );
 
 CREATE INDEX videos_channel_type_idx ON public.videos (channel_id, type);
 CREATE INDEX videos_metadata_pending_idx ON public.videos (video_id)
     WHERE metadata_updated_at IS NULL;
+CREATE INDEX videos_comments_pending_idx ON public.videos (video_id)
+    WHERE comments_updated_at IS NULL;
 
-CREATE TABLE public.channel_scan_state (
-    channel_id TEXT NOT NULL REFERENCES public.channels (channel_id) ON DELETE CASCADE,
-    type TEXT NOT NULL CHECK (type IN ('video', 'short')),
-    PRIMARY KEY (channel_id, type)
+CREATE TABLE public.comments (
+    video_id TEXT NOT NULL REFERENCES public.videos (video_id),
+    comment_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    author_channel_id TEXT,
+    author_name TEXT,
+    is_pinned BOOLEAN,
+    PRIMARY KEY (video_id, comment_id)
 );

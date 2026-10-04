@@ -19,6 +19,7 @@ import uuid
 import httpcore
 import httpx
 import psycopg
+from database_helpers import connect_test_database
 from psycopg.types.json import Jsonb
 
 from collect_video_metadata import collect, fetch_metadata, fetch_metadata_with_proxies, RequestTrace, save_metadata
@@ -474,7 +475,7 @@ def ddl(conn,schema,filename):
 @unittest.skipUnless(os.environ.get('PROXY_TEST_DATABASE')=='1','Opt in to rollback-only database tests')
 class StatisticsDatabaseTests(unittest.TestCase):
     def setUp(self):
-        self.conn=psycopg.connect(dbname='proxy',user='mahmud',host=str(ROOT/'.local/postgres/socket'),connect_timeout=5)
+        self.conn = connect_test_database("proxy", connect_timeout=5)
         self.schema='test_statistics_'+uuid.uuid4().hex
         self.conn.execute('CREATE SCHEMA '+self.schema)
         self.conn.execute('SET LOCAL search_path TO '+self.schema+',public')

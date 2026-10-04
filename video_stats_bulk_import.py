@@ -1,4 +1,4 @@
-"""Verify and import immutable metadata batches, retrying both databases safely."""
+"""Verify and import exact view and like counts from immutable result batches."""
 from __future__ import annotations
 
 import argparse
@@ -16,71 +16,50 @@ import time
 
 import psycopg
 
-from collect_video_metadata import has_metadata, metadata_error_reason
-from collection_policy import data_observation_matches
+from collect_video_stats import has_stats, stats_error_reason, exact_count, MAX_COUNT
+from metadata_bulk_import import read_chunk as read_common_chunk
 from discover_videos import open_database
 from metadata_bulk import atomic_json, digest, utcnow
 from proxy_statistics import Aggregate, AttemptOutcome, ProxyTarget, StatisticsBatch, write_batch
+from collection_policy import data_observation_matches
 
 
 ROOT = Path(__file__).resolve().parent
 VIDEO_ID = re.compile(r'[A-Za-z0-9_-]{11}\Z')
 
 
-def read_chunk(path, run_id, *, success_check=has_metadata):
-    path = Path(path)
-    info = json.loads(path.with_suffix(path.suffix + '.json').read_text())
-    if info['run_id'] != run_id or info['name'] != path.name or digest(path) != info['sha256']:
-        raise ValueError('Result batch identity or checksum mismatch')
-    rows = []
-    with gzip.open(path, 'rt') as source:
-        for line in source:
-            row = json.loads(line)
-            event = row['event']
-            if not VIDEO_ID.fullmatch(event['video_id']) or event['result']['video_id'] != event['video_id']:
-                raise ValueError('Result video identity mismatch')
-            if type(event['final']) is not bool or type(event['successful']) is not bool:
-                raise ValueError('Invalid outcome flags')
-            if success_check(event['result']) != event['successful'] or event['successful'] and not event['final']:
-                raise ValueError('Result success classification mismatch')
-            at = datetime.fromisoformat(event['at'])
-            if at.tzinfo is None:
-                raise ValueError('Result timestamp needs a timezone')
-            rows.append(row)
-    if len(rows) != info['rows'] or [row['seq'] for row in rows] != list(range(info['first_seq'], info['last_seq'] + 1)):
-        raise ValueError('Result sequence is incomplete or duplicated')
-    return info, rows
+def read_chunk(path, run_id):
+    return read_common_chunk(path, run_id, success_check=has_stats)
 
 
-def text_value(value):
-    if value is not None and not isinstance(value, str):
-        raise ValueError('Metadata text has an invalid type')
-    # PostgreSQL text cannot hold NUL; retain a visible replacement character.
-    return value.replace('\x00', '\ufffd') if value is not None else None
-
-
-def metadata_rows(rows):
+def statistics_rows(rows):
     selected = {}
     for row in rows:
         event = row['event']
         if not event['final']:
             continue
         previous = selected.get(event['video_id'])
-        if previous is None or not previous['successful'] or event['successful']:
+        if previous is None or (event['at'] >= previous['at'] and
+                                (event['successful'] or not previous['successful'])):
             selected[event['video_id']] = event
     output = []
     for video_id, event in selected.items():
-        metadata = event['result'].get('metadata') or {}
-        duration = metadata.get('duration_seconds')
-        if duration is not None and (type(duration) is not int or not 0 <= duration <= 2**31 - 1):
-            raise ValueError('Invalid metadata duration')
-        published = metadata.get('published_at')
-        published = datetime.fromisoformat(published) if published else None
-        if published is not None and published.tzinfo is None:
-            raise ValueError('Publication time needs a timezone')
-        output.append((video_id, event['successful'], text_value(metadata.get('title')),
-            text_value(metadata.get('description')), duration, published, text_value(metadata.get('thumbnail_url')),
-            datetime.fromisoformat(event['at']), None if event['successful'] else metadata_error_reason(event['result'])))
+        result = event['result']
+        stats = result.get('stats') or {}
+        values = [stats.get(name) for name in ('view_count', 'like_count')]
+        if any(value is not None and (type(value) is not int or not 0 <= value <= MAX_COUNT) for value in values):
+            raise ValueError('Invalid statistics count')
+        if event['successful']:
+            evidence = result.get('evidence') or {}
+            if evidence.get('response_video_id') != video_id:
+                raise ValueError('Statistics evidence has a mismatched video ID')
+            if values[0] is not None and exact_count(evidence.get('view_text'), 'view') != values[0]:
+                raise ValueError('View count does not match exact source evidence')
+            kind = 'number' if evidence.get('like_source') == 'title' else 'like'
+            if values[1] is not None and exact_count(evidence.get('like_text'), kind) != values[1]:
+                raise ValueError('Like count does not match exact source evidence')
+        output.append((video_id, event['successful'], *values, datetime.fromisoformat(event['at']),
+                       stats_error_reason(result)))
     return output
 
 
@@ -96,47 +75,45 @@ def statistics_batch(rows, key):
         proxy = event['proxy']
         target = ProxyTarget.from_catalog(proxy['id'], bytes.fromhex(proxy['key']), proxy['protocol'])
         if not data_observation_matches(event['result'], event['successful'], outcome.data_received, outcome.http_status):
-            raise ValueError('Statistics and metadata success disagree')
+            raise ValueError('Proxy and video statistics success disagree')
         aggregates.setdefault(target, Aggregate()).add(outcome, target.protocol)
     return StatisticsBatch(aggregates, key=key)
 
 
-def apply_metadata(conn, values):
-    conn.execute('''CREATE TEMP TABLE bulk_metadata_stage(
-        video_id TEXT PRIMARY KEY,successful BOOLEAN,title TEXT,description TEXT,duration_seconds INTEGER,
-        published_at TIMESTAMPTZ,thumbnail_url TEXT,observed_at TIMESTAMPTZ,error TEXT) ON COMMIT DROP''')
-    with conn.cursor().copy('COPY bulk_metadata_stage FROM STDIN') as copy:
+def apply_statistics(conn, values):
+    conn.execute('''CREATE TEMP TABLE bulk_statistics_stage(
+        video_id TEXT PRIMARY KEY,successful BOOLEAN,view_count BIGINT,like_count BIGINT,
+        observed_at TIMESTAMPTZ,error TEXT) ON COMMIT DROP''')
+    with conn.cursor().copy('COPY bulk_statistics_stage FROM STDIN') as copy:
         for row in values:
             copy.write_row(row)
-    matched = conn.execute('SELECT count(*) FROM bulk_metadata_stage s JOIN videos v USING(video_id)').fetchone()[0]
+    matched = conn.execute('SELECT count(*) FROM bulk_statistics_stage s JOIN videos v USING(video_id)').fetchone()[0]
     if matched != len(values):
         raise ValueError('A selected video is missing from the database')
     saved = conn.execute('''UPDATE videos v SET
-        title=coalesce(s.title,v.title),description=coalesce(s.description,v.description),
-        duration_seconds=coalesce(s.duration_seconds,v.duration_seconds),
-        published_at=coalesce(s.published_at,v.published_at),thumbnail_url=coalesce(s.thumbnail_url,v.thumbnail_url),
-        metadata_updated_at=s.observed_at,metadata_error=NULL
-        FROM bulk_metadata_stage s WHERE v.video_id=s.video_id AND s.successful AND v.metadata_updated_at IS NULL''').rowcount
-    errors = conn.execute('''UPDATE videos v SET metadata_error=s.error FROM bulk_metadata_stage s
-        WHERE v.video_id=s.video_id AND NOT s.successful AND v.metadata_updated_at IS NULL
-          AND v.metadata_error IS DISTINCT FROM s.error''').rowcount
-    return {'metadata_saved': saved, 'errors_recorded': errors, 'final_outcomes': len(values)}
+        view_count=coalesce(s.view_count,v.view_count),like_count=coalesce(s.like_count,v.like_count),
+        stats_updated_at=s.observed_at,stats_error=s.error
+        FROM bulk_statistics_stage s WHERE v.video_id=s.video_id AND s.successful
+          AND (v.stats_updated_at IS NULL OR v.stats_updated_at<s.observed_at)''').rowcount
+    errors = conn.execute('''UPDATE videos v SET stats_error=s.error FROM bulk_statistics_stage s
+        WHERE v.video_id=s.video_id AND NOT s.successful AND v.stats_updated_at IS NULL
+          AND v.stats_error IS DISTINCT FROM s.error''').rowcount
+    return {'statistics_saved': saved, 'errors_recorded': errors, 'final_outcomes': len(values)}
 
 
 def apply_chunk(media, proxy, path, run_id):
     info, rows = read_chunk(path, run_id)
     key = hashlib.sha256((run_id + ':' + info['sha256']).encode()).digest()
     batch = statistics_batch(rows, key)
-    values = metadata_rows(rows)
-    # Hold the statistics transaction until metadata commits. After an uncertain
-    # acknowledgement, the same digest retries statistics and successful videos
-    # are skipped by their existing metadata timestamp.
+    values = statistics_rows(rows)
+    # Hold the proxy transaction until video counts commit. Replaying the same
+    # checksummed batch preserves counters and skips already applied timestamps.
     with proxy.transaction():
         stats = write_batch(proxy, batch)
         if stats['unmatched_attempts'] or stats['stale_attempts']:
             raise ValueError('Refusing mismatched or overlapping proxy statistics')
         with media.transaction():
-            saved = apply_metadata(media, values)
+            saved = apply_statistics(media, values)
     return {'file': path.name, 'first_seq': info['first_seq'], 'last_seq': info['last_seq'],
             'events': len(rows), **saved, 'statistics': stats}
 
@@ -149,7 +126,7 @@ def sync(args):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     state_path = folder / 'import-status.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {
-        'run_id': args.run_id, 'last_seq': 0, 'metadata_saved': 0, 'errors_recorded': 0,
+        'run_id': args.run_id, 'last_seq': 0, 'statistics_saved': 0, 'errors_recorded': 0,
         'events_imported': 0, 'batches': 0, 'started_at': utcnow()}
     if state['run_id'] != args.run_id:
         raise ValueError('Import state belongs to another run')
@@ -158,12 +135,12 @@ def sync(args):
         try:
             if media is None or media.closed:
                 media = open_database(autocommit=True)
-                if not media.execute("SELECT pg_try_advisory_lock(hashtext('media.video-metadata'))").fetchone()[0]:
+                if not media.execute("SELECT pg_try_advisory_lock(hashtext('media.video-statistics'))").fetchone()[0]:
                     media.close()
-                    raise RuntimeError('Another metadata collector is running')
+                    raise RuntimeError('Another statistics collector is running')
             if proxy is None or proxy.closed:
                 proxy = psycopg.connect(dbname='proxy', user='mahmud', host=str(ROOT / '.local/postgres/socket'),
-                    port=5432, autocommit=True, application_name='bulk-metadata-import')
+                    port=5432, autocommit=True, application_name='bulk-statistics-import')
             subprocess.run(['rsync', '-a', '--ignore-existing', '--include=*.jsonl.gz',
                 '--include=*.jsonl.gz.json', '--exclude=*', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=10',
                 f'{args.host}:{args.remote}/outbox/', str(folder / 'outbox') + '/'], check=True, timeout=120,
@@ -179,7 +156,7 @@ def sync(args):
                     break
                 result = apply_chunk(media, proxy, path, args.run_id)
                 state.update(last_seq=result['last_seq'], updated_at=utcnow(), last_batch=result, error=None)
-                for name in ('metadata_saved', 'errors_recorded'):
+                for name in ('statistics_saved', 'errors_recorded'):
                     state[name] += result[name]
                 state['events_imported'] += result['events']
                 state['batches'] += 1

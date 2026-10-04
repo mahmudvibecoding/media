@@ -37,6 +37,51 @@ Stopping preserves completed results. Requests cancelled before a YouTube
 response remain eligible on resume. A restart may change concurrency; it must
 retain the same input, request settings, deadlines, and run identifier.
 
+## Parallel full retests
+
+`parallel_retest.py` splits a fresh catalog manifest into disjoint groups and
+runs the existing Go tester in separate processes. Each process retains its own
+journal, checksums, and resume state. The controller refuses changed settings on
+resume and verifies the combined completion count. Results stay private.
+
+On the testing server, run:
+
+```sh
+python3 parallel_retest.py \
+  --input /path/to/catalog/manifest.json \
+  --binary /opt/media-proxy-tester/bin/proxy-tester \
+  --run-dir /path/to/new-run/full \
+  --processes 4 --concurrency 20000
+```
+
+Concurrency is per process. This command allows 80,000 simultaneous checks in
+total, using the existing 3-second connection and 10-second request deadlines.
+The controller divides available CPUs between processes through `GOMAXPROCS`;
+`--gomaxprocs` overrides that per-process setting. The service or shell must
+provide the existing `LimitNOFILE=1048576` allowance.
+
+For a short comparison, use a new run directory with `--sample-shards 12
+--duration 30`. The sample is deterministic. Compare response retention as well
+as completion speed. On October 3, four processes at 20,000 checks each completed
+831,810 checks in the short benchmark, versus 622,307 for one process at 80,000.
+Four processes at 40,000 completed more checks but retained only 66.1% of the
+reference responders, versus 86.8% at 20,000. The full four-process retest
+processed all 6,014,525 configurations in 241.119 seconds with no local resource
+errors. These are historical measurements; preparation, tuning, recovery, and
+database import have separate durations.
+
+Compress stopped journals in parallel before transferring them:
+
+```sh
+python3 seal_results.py --workers 4 \
+  --journals /path/to/new-run/full/part-*/results.jsonl
+```
+
+Keep the `.meta.json`, `.summary.json`, and `.sealed.json` sidecars beside each
+compressed journal. Import tuning rounds first, then full-run parts, then any
+later recovery round. Full-run parts contain disjoint configurations and can be
+imported in any order within that round.
+
 ## Request
 
 - `POST https://www.youtube.com/youtubei/v1/player`

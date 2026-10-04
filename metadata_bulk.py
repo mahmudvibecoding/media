@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import fcntl
+from functools import lru_cache
 import gzip
 import hashlib
 import heapq
@@ -27,10 +28,24 @@ import time
 import uuid
 
 from collect_video_metadata import fetch_metadata, has_metadata, metadata_error_reason
+from collection_policy import (CollectionOutcome, VIDEO_CONFIRMATION_MAX_AGE, ProxyPerformance,
+                               classify_outcome)
 from proxy_catalog import CatalogClients, CatalogProxy, load_catalog
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+@lru_cache(maxsize=32)
+def collector_functions(folder):
+    """Select the collector recorded in the immutable run manifest."""
+    kind = json.loads((Path(folder) / 'manifest.json').read_text()).get('collector', 'metadata')
+    if kind == 'statistics':
+        from collect_video_stats import fetch_stats, has_stats, stats_error_reason
+        return fetch_stats, has_stats, stats_error_reason
+    if kind != 'metadata':
+        raise ValueError('Unknown collector type')
+    return fetch_metadata, has_metadata, metadata_error_reason
 
 
 def utcnow():
@@ -70,6 +85,29 @@ def connect_queue(path):
         if conn.in_transaction:
             conn.rollback()
         conn.close()
+
+
+def ensure_policy_tables(conn):
+    """Add scheduling state to old queues without rewriting jobs or journals."""
+    conn.execute('''CREATE TABLE IF NOT EXISTS proxy_performance(
+        proxy_id INTEGER PRIMARY KEY,quality REAL NOT NULL,latency_seconds REAL,
+        samples INTEGER NOT NULL,failure_streak INTEGER NOT NULL,
+        updated_at REAL NOT NULL,cooldown_until REAL NOT NULL)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS video_error_evidence(
+        video_id TEXT PRIMARY KEY,reason TEXT NOT NULL,proxy_id INTEGER NOT NULL,
+        observed_at REAL NOT NULL)''')
+
+
+def confirm_video_error(conn, video_id, proxy_id, reason, observed_at):
+    previous = conn.execute('SELECT * FROM video_error_evidence WHERE video_id=?', (video_id,)).fetchone()
+    if (previous and previous['reason'] == reason and
+            0 <= observed_at - previous['observed_at'] <= VIDEO_CONFIRMATION_MAX_AGE):
+        return previous['proxy_id'] != proxy_id
+    conn.execute('''INSERT INTO video_error_evidence VALUES (?,?,?,?)
+        ON CONFLICT(video_id) DO UPDATE SET reason=excluded.reason,
+            proxy_id=excluded.proxy_id,observed_at=excluded.observed_at''',
+        (video_id, reason, proxy_id, observed_at))
+    return False
 
 
 def export_snapshot(folder):
@@ -143,6 +181,7 @@ def initialize(folder, workers, concurrency, max_attempts):
                 successes INTEGER NOT NULL DEFAULT 0,local_failures INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL);
         ''')
+        ensure_policy_tables(conn)
         conn.execute('BEGIN IMMEDIATE')
         config = {'run_id': manifest['run_id'], 'workers': workers, 'max_attempts': max_attempts,
                   'exported_seq': 0, 'round': 1, 'state': 'ready', 'started_at': None}
@@ -187,25 +226,38 @@ def recover_leases(folder, worker):
 def finish(folder, worker, events):
     if not events:
         return
+    _, has_data, error_reason = collector_functions(str(Path(folder).resolve()))
     with connect_queue(Path(folder) / 'queue.sqlite3') as conn:
         conn.execute('BEGIN IMMEDIATE')
+        ensure_policy_tables(conn)
         max_attempts = setting(conn, 'max_attempts')
-        counts = Counter()
+        counts, performance = Counter(), {}
         for event in events:
             job = conn.execute('SELECT * FROM jobs WHERE video_id=?', (event['video_id'],)).fetchone()
             if job is None or job['status'] != 'leased' or job['owner'] != worker:
                 raise ValueError('Result does not own its video lease')
             observed = event['observation'] is not None
-            successful = has_metadata(event['result'])
+            successful = has_data(event['result'])
             if successful and not observed:
                 raise ValueError('A metadata success requires an attempt observation')
+            proxy_id = event['proxy']['id']
+            at = datetime.fromisoformat(event['at']).timestamp()
+            outcome = classify_outcome(event['result'], event['observation'], successful)
+            confirmed = bool(outcome.video_error and confirm_video_error(
+                conn, event['video_id'], proxy_id, outcome.video_error, at))
+            if proxy_id not in performance:
+                row = conn.execute('SELECT * FROM proxy_performance WHERE proxy_id=?', (proxy_id,)).fetchone()
+                usage = conn.execute('SELECT * FROM proxy_usage WHERE proxy_id=?', (proxy_id,)).fetchone()
+                performance[proxy_id] = ProxyPerformance.restore(row, dict(usage or {}), at)
+            performance[proxy_id].observe(outcome, event['result'].get('seconds'), at)
             attempts = job['attempts'] + int(observed)
             local_failures = job['local_failures'] + int(not observed)
-            final = successful or attempts >= max_attempts or local_failures >= 5
+            final = successful or confirmed or attempts >= max_attempts or local_failures >= 5
             status = 'saved' if successful else 'failed' if final else 'retry' if observed else 'ready'
-            error = None if successful else metadata_error_reason(event['result'])
+            error = None if successful else error_reason(event['result'])
             event.update(attempt=attempts, final=final, successful=successful,
-                         local_failure=not observed, kind=job['kind'], worker=worker)
+                         local_failure=not observed, kind=job['kind'], worker=worker,
+                         outcome_category=outcome.category, video_error_confirmed=confirmed)
             payload = json.dumps(event, separators=(',', ':'), default=str)
             conn.execute('INSERT INTO events(worker,proxy_id,video_id,payload) VALUES (?,?,?,?)',
                          (worker, event['proxy']['id'], event['video_id'], payload))
@@ -221,6 +273,12 @@ def finish(folder, worker, events):
             if observed:
                 counts.update(requests_sent=int(event['observation']['request_sent']),
                               responses_received=int(event['observation']['http_status'] is not None))
+        conn.executemany('''INSERT INTO proxy_performance VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(proxy_id) DO UPDATE SET quality=excluded.quality,
+                latency_seconds=excluded.latency_seconds,samples=excluded.samples,
+                failure_streak=excluded.failure_streak,updated_at=excluded.updated_at,
+                cooldown_until=excluded.cooldown_until''',
+            [(proxy_id, *asdict(profile).values()) for proxy_id, profile in performance.items()])
         conn.executemany('UPDATE counters SET value=value+? WHERE name=?', [(v, k) for k, v in counts.items()])
         conn.commit()
 
@@ -303,79 +361,135 @@ def run_broker(folder):
 
 
 class ProxyPool:
-    """One active request per configuration, with fast reuse after data successes."""
-    def __init__(self, proxies, usage):
+    """One request per proxy, ranked by recent success and successful-response time."""
+    def __init__(self, proxies, usage, performance=None):
         self.proxies = proxies
-        self.untested = deque(i for i, p in enumerate(proxies) if p.proxy_id not in usage)
+        performance = performance or {}
+        wall_now = time.time()
+        self.performance = [ProxyPerformance.restore(performance.get(p.proxy_id),
+                            usage.get(p.proxy_id, {}), wall_now) for p in proxies]
+        self.untested = deque(i for i, p in enumerate(proxies)
+                              if p.proxy_id not in usage and p.proxy_id not in performance)
         self.proven = {i for i, p in enumerate(proxies) if usage.get(p.proxy_id, {}).get('successes', 0)}
-        self.good = [(0.0, i) for i in self.proven]
-        self.ready = [(time.monotonic() + 60, i) for i, p in enumerate(proxies)
-                      if p.proxy_id in usage and i not in self.proven]
-        heapq.heapify(self.good)
-        heapq.heapify(self.ready)
-        self.failures = Counter({i: min(6, usage[p.proxy_id].get('attempts', 0))
-                                 for i, p in enumerate(proxies) if p.proxy_id in usage and i not in self.proven})
+        self.active, self.available, self.available_proven = set(), {}, set()
+        self.ranked, self.oldest, self.cooling = [], [], []
+        self.versions = [0] * len(proxies)
+        self.order = 0
+        untested = set(self.untested)
+        for index, profile in enumerate(self.performance):
+            if index not in untested:
+                self._schedule(index, max(0, profile.cooldown_until - wall_now))
         self.recovery = False
         self.selections = 0
         self.changed = asyncio.Event()
 
+    def _schedule(self, index, delay):
+        self.versions[index] += 1
+        heapq.heappush(self.cooling, (time.monotonic() + delay, index, self.versions[index]))
+
+    def _promote(self, now):
+        while self.cooling and self.cooling[0][0] <= now:
+            _, index, version = heapq.heappop(self.cooling)
+            self.order += 1
+            self.available[index] = (version, self.order)
+            heapq.heappush(self.ranked, (-self.performance[index].score, self.order, index, version))
+            heapq.heappush(self.oldest, (self.order, index, version))
+            if index in self.proven:
+                self.available_proven.add(index)
+
+    def _activate(self, index):
+        self.available.pop(index, None)
+        self.available_proven.discard(index)
+        self.active.add(index)
+        self.selections += 1
+        # Selecting through one heap leaves a stale entry in the other. Bound
+        # those entries so a long collection does not grow scheduler memory.
+        if max(len(self.ranked), len(self.oldest)) > max(64, 4 * len(self.proxies)):
+            self.ranked = [(-self.performance[i].score, order, i, version)
+                           for i, (version, order) in self.available.items()]
+            self.oldest = [(order, i, version) for i, (version, order) in self.available.items()]
+            heapq.heapify(self.ranked)
+            heapq.heapify(self.oldest)
+        return index
+
+    def _take(self, queue, previous):
+        held, chosen = [], None
+        while queue:
+            entry = heapq.heappop(queue)
+            index, version = entry[-2:]
+            current = self.available.get(index)
+            if current is None or current[0] != version:
+                continue
+            if self.proxies[index].proxy_id == previous:
+                held.append(entry)
+                continue
+            chosen = index
+            break
+        for entry in held:
+            heapq.heappush(queue, entry)
+        return self._activate(chosen) if chosen is not None else None
+
     async def acquire(self, previous=None):
         while True:
-            if self.untested:
-                index = self.untested.popleft()
-                if self.proxies[index].proxy_id == previous and self.untested:
-                    self.untested.append(index)
-                    index = self.untested.popleft()
-                return index
             now = time.monotonic()
-            allow_other = not self.recovery or not self.proven
-            good_available = bool(self.good and self.good[0][0] <= now)
-            other_available = bool(allow_other and self.ready and self.ready[0][0] <= now)
-            candidates = ([self.good] if good_available else []) + ([self.ready] if other_available else [])
-            if candidates:
-                # Keep a small exploration share without letting a large failed
-                # catalog crowd out configurations that return metadata.
-                queue = self.ready if other_available and (not good_available or self.selections % 20 == 19) else self.good
-                _, index = heapq.heappop(queue)
-                if self.proxies[index].proxy_id == previous and any(q and q[0][0] <= now for q in candidates):
-                    heapq.heappush(queue, (now + 0.01, index))
-                    continue
-                self.selections += 1
-                return index
-            deadlines = [q[0][0] for q in (self.good, self.ready if allow_other else []) if q]
-            wait = max(0.01, min(1.0, min(deadlines) - now)) if deadlines else 1.0
+            self._promote(now)
+            if self.untested and (not self.recovery or not self.available_proven):
+                index = self.untested.popleft()
+                if self.proxies[index].proxy_id == previous:
+                    if self.untested:
+                        self.untested.append(index)
+                        index = self.untested.popleft()
+                    elif self.available:
+                        self.untested.append(index)
+                        index = None
+                if index is not None:
+                    return self._activate(index)
+            if self.available:
+                # One selection in twenty checks the longest-waiting eligible
+                # configuration, including slow or formerly unsuccessful ones.
+                queue = self.oldest if self.selections % 20 == 19 else self.ranked
+                index = self._take(queue, previous)
+                if index is None:
+                    index = self._take(queue, None)
+                if index is not None:
+                    return index
+            wait = max(0.01, min(1.0, self.cooling[0][0] - now)) if self.cooling else 1.0
             self.changed.clear()
             try:
                 await asyncio.wait_for(self.changed.wait(), wait)
             except TimeoutError:
                 pass
 
-    def release(self, index, successful, local_failure=False):
-        if successful:
+    def release(self, index, successful=False, local_failure=False, *, outcome=None, seconds=None):
+        if index not in self.active:
+            raise ValueError('Proxy has no active request')
+        if outcome is None:
+            outcome = CollectionOutcome('local_error' if local_failure else 'data' if successful else 'connection_error',
+                                        None if local_failure else successful)
+        if outcome.category == 'data':
             self.proven.add(index)
-            self.failures[index] = 0
-            delay = 0
-        else:
-            self.failures[index] += 1
-            delay = min(60, 2 ** min(6, self.failures[index]))
-            if local_failure:
-                delay = max(60, delay)
-        heapq.heappush(self.good if index in self.proven else self.ready, (time.monotonic() + delay, index))
+        now = time.time()
+        self.performance[index].observe(outcome, seconds, now)
+        self.active.remove(index)
+        self._schedule(index, max(0, self.performance[index].cooldown_until - now))
         self.changed.set()
 
 
 async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
     folder = Path(folder)
+    fetch, has_data, _ = collector_functions(str(folder.resolve()))
     lock = (folder / 'workers' / f'{worker}.lock').open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     recover_leases(folder, worker)
     with connect_queue(folder / 'queue.sqlite3') as conn:
+        ensure_policy_tables(conn)
         workers = setting(conn, 'workers')
         usage = {row['proxy_id']: dict(row) for row in conn.execute('SELECT * FROM proxy_usage')}
+        performance = {row['proxy_id']: dict(row) for row in conn.execute('SELECT * FROM proxy_performance')}
     proxies = [proxy for i, proxy in enumerate(load_proxies(folder)) if i % workers == worker]
     if not proxies:
         raise ValueError('Worker has no proxy configurations')
-    pool = ProxyPool(proxies, usage)
+    pool = ProxyPool(proxies, usage, performance)
     pending = deque()
     writes = asyncio.Queue(maxsize=1024)
     fetching = asyncio.Lock()
@@ -440,16 +554,17 @@ async def run_worker(folder, worker, connect_timeout=5, total_timeout=20):
             active += 1
             observations = []
             try:
-                result = await fetch_metadata(clients[index], job['video_id'], retries=0,
+                result = await fetch(clients[index], job['video_id'], retries=0,
                     on_attempt=observations.append, total_timeout=total_timeout)
                 observation = asdict(observations[0]) if observations else None
                 event = {'video_id': job['video_id'], 'at': utcnow(), 'result': result,
                          'proxy': {'id': proxy.proxy_id, 'key': proxy.connection_key.hex(),
                                    'protocol': proxy.working_protocol}, 'observation': observation}
-                successful = has_metadata(result)
+                successful = has_data(result)
                 await writes.put(event)
                 counts.update(completed=1, saved=int(successful), local_errors=int(observation is None))
-                pool.release(index, successful, observation is None)
+                pool.release(index, outcome=classify_outcome(result, observation, successful),
+                             seconds=result.get('seconds'))
             finally:
                 active -= 1
 
@@ -549,6 +664,7 @@ def run_controller(folder):
     lock = (folder / 'controller.lock').open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     with connect_queue(folder / 'queue.sqlite3') as conn:
+        ensure_policy_tables(conn)
         workers = setting(conn, 'workers')
         if setting(conn, 'started_at') is None:
             conn.execute("UPDATE settings SET value=? WHERE key='started_at'", (json.dumps(utcnow()),))

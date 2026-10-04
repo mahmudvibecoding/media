@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from collect_proxies import DB
+from database_helpers import connect_test_database
 from proxy_formats import Proxy, canonical_json, pack_connection_settings, unpack_connection_settings
 from proxy_statistics import Aggregate, AttemptOutcome, ProxyTarget, StatisticsBatch, proxy_connection_error, write_batch
 
@@ -66,7 +66,7 @@ class ErrorSeparationTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('PROXY_TEST_DATABASE') == '1', 'Opt in to rollback-only database tests')
 class SharedProtocolDatabaseTests(unittest.TestCase):
     def setUp(self):
-        self.conn = psycopg.connect(**DB)
+        self.conn = connect_test_database("proxy")
         self.schema = 'test_shared_protocol_' + uuid.uuid4().hex
         self.conn.execute('CREATE SCHEMA ' + self.schema)
         self.conn.execute('SET LOCAL search_path TO ' + self.schema + ',public')

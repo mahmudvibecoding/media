@@ -9,7 +9,7 @@ import uuid
 import psycopg
 from psycopg.rows import dict_row
 
-from collect_proxies import DB
+from database_helpers import connect_test_database
 from proxy_catalog import load_catalog
 from proxy_statistics import Aggregate, AttemptOutcome, ProxyTarget, StatisticsBatch, write_batch
 
@@ -25,7 +25,7 @@ spec.loader.exec_module(importer)
 @unittest.skipUnless(os.environ.get('PROXY_TEST_DATABASE') == '1', 'Opt in to rollback-only database tests')
 class CheckFieldRemovalDatabaseTests(unittest.TestCase):
     def setUp(self):
-        self.conn = psycopg.connect(**DB)
+        self.conn = connect_test_database("proxy")
         self.schema = 'test_check_fields_' + uuid.uuid4().hex
         self.conn.execute('CREATE SCHEMA ' + self.schema)
         self.conn.execute('SET LOCAL search_path TO ' + self.schema + ',public')

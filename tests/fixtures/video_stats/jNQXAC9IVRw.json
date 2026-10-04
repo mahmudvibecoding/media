@@ -1,0 +1,61 @@
+{
+  "contents": {
+    "twoColumnWatchNextResults": {
+      "results": {
+        "results": {
+          "contents": [
+            {
+              "videoPrimaryInfoRenderer": {
+                "viewCount": {
+                  "videoViewCountRenderer": {
+                    "viewCount": {
+                      "simpleText": "439,482,129 views"
+                    },
+                    "shortViewCount": {
+                      "simpleText": "439M views"
+                    },
+                    "originalViewCount": "0"
+                  }
+                },
+                "videoActions": {
+                  "menuRenderer": {
+                    "topLevelButtons": [
+                      {
+                        "segmentedLikeDislikeButtonViewModel": {
+                          "likeButtonViewModel": {
+                            "likeButtonViewModel": {
+                              "toggleButtonViewModel": {
+                                "toggleButtonViewModel": {
+                                  "defaultButtonViewModel": {
+                                    "buttonViewModel": {
+                                      "iconName": "LIKE",
+                                      "title": "19M",
+                                      "accessibilityText": "like this video along with 19,982,779 other people"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {}
+                    ]
+                  }
+                }
+              }
+            },
+            {},
+            {},
+            {}
+          ]
+        }
+      }
+    }
+  },
+  "currentVideoEndpoint": {
+    "watchEndpoint": {
+      "videoId": "jNQXAC9IVRw"
+    }
+  }
+}

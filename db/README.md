@@ -1,7 +1,7 @@
 # Local PostgreSQL databases
 
 - YouTube database: `media`
-- YouTube tables: `public.channels`, `public.videos`, `public.channel_scan_state`
+- YouTube tables: `public.channels`, `public.videos`, `public.comments`
 - Proxy database: `proxy`
 - Proxy tables: `public.proxies`, `public.proxy_stats`, `public.proxy_lists`
 - Channels: `channel_id TEXT PRIMARY KEY`, nullable `subscriber_count BIGINT`
@@ -334,6 +334,10 @@ is required.
 The weights in `proxy_stats` are anchored at the last scored attempt; the weights
 exposed by `proxy_health` have already decayed to query time. The denominator uses
 YouTube's scored attempts; `connection_attempts` remains a shared lifetime counter.
+Parsed video-unavailability responses are recorded with a `video:` error label
+and excluded from the weighted success score. They still increment connection,
+request and response counters, but never the successful-data counter. Temporary
+request failures remain scored failures.
 
 ```sql
 SELECT proxy_id,address,port,connection_attempts,youtube_requests_sent,
@@ -452,8 +456,15 @@ Created with `db/migrations/002_videos.sql`:
 - `thumbnail_url TEXT`: nullable; the last thumbnail URL returned by the metadata endpoint.
 - `metadata_updated_at TIMESTAMPTZ`: nullable; the time of the last successful metadata save.
 - `metadata_error TEXT`: nullable; the latest metadata failure reason, cleared by a successful save.
+- `view_count BIGINT`: nullable; the latest collected total views, constrained to nonnegative values.
+- `like_count BIGINT`: nullable; the latest collected total likes, constrained to nonnegative values.
+- `stats_updated_at TIMESTAMPTZ`: nullable; when the saved statistics were successfully collected.
+- `stats_error TEXT`: nullable; the latest statistics collection error, cleared by a successful save.
+- `comments_updated_at TIMESTAMPTZ`: nullable; when the latest successful comment scan finished importing.
+- `comments_error TEXT`: nullable; the latest comment collection error, cleared after a successful scan finishes importing.
 - Index: `(channel_id, type)`.
 - Pending metadata index: `(video_id) WHERE metadata_updated_at IS NULL`.
+- Pending comments index: `(video_id) WHERE comments_updated_at IS NULL`.
 
 Title, description, and duration were added with `db/migrations/004_video_metadata.sql`.
 `db/migrations/005_drop_video_player_status.sql` removes the former `player_status`
@@ -482,25 +493,118 @@ With `MEDIA_PROXY_URLS` or catalog mode, each video instead gets one attempt
 through its assigned proxy. Assignment rotates between videos; a failed attempt
 stores the error and processing moves to the next video.
 
-The discovery collector inserts the returned IDs from both tabs, including the
-initial batch. The primary key skips known IDs with `ON CONFLICT DO NOTHING`;
+`db/migrations/009_video_stats.sql` adds the four statistics columns with no
+non-NULL defaults. Unknown or unavailable counts remain `NULL`; an actual zero
+is stored as `0`. Statistics collectors should save counts and their observation
+time atomically, clearing `stats_error` on success. Failed refreshes should update
+only `stats_error`, preserving previous counts and `stats_updated_at`.
+`metadata_updated_at` continues to track metadata independently. These columns
+are ready for a statistics collector.
+
+The discovery collector inserts the returned IDs from both tabs. The primary
+key skips known IDs with `ON CONFLICT DO NOTHING`;
 `RETURNING video_id` identifies newly inserted rows. Existing metadata is preserved.
 Each complete tab scan commits as one transaction, and new rows have
-`published_at=NULL`. Later scans follow pagination through the previously stored
-range. A failed scan inserts no partial results, so a retry can safely start from
+`published_at=NULL`. Every scan follows pagination through the previously stored
+range or to the end of the tab. A first scan with no stored range follows the
+available history, subject to the configured page limit. A failed scan inserts
+no partial results, so a retry can safely start from
 page one. Recurring polling is still a separate step. The local `media_viewer`
 role has SELECT on this table, granted
 separately from the portable schema migration.
 
-## Scan initialization
+## Comments
 
-`db/migrations/003_channel_scan_state.sql` adds `channel_scan_state` with only
-`channel_id` and `type`, jointly its primary key. One row means that tab completed
-its initial scan. It stores no video IDs or timestamps. Empty and absent tabs
-also get a marker, so later uploads receive pagination even when no videos were
-previously stored. Markers and video inserts commit together. The migration seeds
-markers from existing video rows; the local setup also restored absent-tab markers
-from the last verified 100-channel run.
+`db/migrations/011_video_comments.sql` adds `public.comments`, the two comment
+progress columns on `videos`, and `videos_comments_pending_idx`. Apply it once
+after migration `010`. Fresh databases use the matching `db/schema.sql`.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `video_id` | `TEXT NOT NULL` | References `videos.video_id`. |
+| `comment_id` | `TEXT NOT NULL` | YouTube comment identifier. |
+| `text` | `TEXT NOT NULL` | Full displayed text, including Unicode and line breaks. Empty text is allowed. |
+| `author_channel_id` | `TEXT` | Author's channel ID when available. |
+| `author_name` | `TEXT` | Author's displayed name when available. |
+| `is_pinned` | `BOOLEAN` | TRUE or FALSE when known; NULL when unknown. |
+
+The primary key `(video_id, comment_id)` prevents duplicate comments on a video
+and supports fetching a video's saved history. The foreign key rejects unknown
+videos and prevents removing a referenced video without handling its comments.
+There are exactly six comment columns. Replies, likes, publication dates, and
+per-comment collection times are outside this schema.
+
+`collect_video_comments.py` implements single-video collection. `comments_bulk.py`
+and `comments_bulk_import.py` provide durable page resume and local or remote
+outbox import. The write contract is:
+
+- Buffer individual pages in SQLite; incomplete scans do not insert public rows.
+- After the scan and all its pages have been imported, update
+  `comments_updated_at` and clear `comments_error` in the completion transaction.
+- On failure, update only `comments_error`; preserve prior comments and the last
+  successful `comments_updated_at` value.
+- Keep continuation tokens, active scan IDs, and saved-history boundaries in the
+  durable worker queue. There is no `comment_scan_state` table.
+
+The single-video collector buffers pages in temporary SQLite storage and imports
+only after it reaches saved history or the end. It copies the prior completed
+history before fetching and holds a per-video advisory lock using
+`hashtextextended('media.video-comments:' || video_id, 0)`. Other comment writers
+must coordinate through that lock. A failed run discards its buffer; its next
+attempt restarts from page one. Successful empty or disabled sections also
+advance the completion timestamp. Unavailable videos retain the prior timestamp
+and record an error.
+
+The bulk importer uses the same per-video advisory lock. It verifies a whole
+checksummed batch before importing any of its scans, then commits each successful
+scan's rows and completion timestamp together. Its local `import.sqlite3` journal
+records the proposed timestamp before PostgreSQL commits, allowing recovery after
+a lost acknowledgement without advancing that timestamp twice. A snapshot whose
+baseline no longer matches the database cannot overwrite a newer completed scan.
+Resume tokens, frozen history, leases, and import receipts remain in run files;
+the public schema still has only six comment fields and two video progress fields.
+
+The migration gives both video progress columns NULL defaults, including for
+existing videos. The partial index covers videos with no successful comment scan
+yet, including those with a recorded error.
+
+Portable schema files do not create roles or grant access. On this local setup,
+grant the existing read-only viewer account access after applying the migration:
+
+```sql
+GRANT SELECT ON public.comments TO media_viewer;
+```
+
+The viewer's existing SELECT permission on `videos` also covers its new columns.
+Schema, constraint, migration, and permission checks are in
+`tests/test_comments_schema.py`, `tests/test_collect_video_comments.py`, and
+`tests/test_comments_bulk.py`.
+Database tests use an isolated schema and roll
+back their fixtures:
+
+```sh
+MEDIA_TEST_DATABASE_URL="host=$PWD/.local/postgres/socket dbname=media user=mahmud" \
+  .venv/bin/python -m unittest discover -s tests -p '*comments*.py' -v
+```
+
+## Remove scan initialization markers
+
+`db/migrations/010_drop_channel_scan_state.sql` removes `channel_scan_state`.
+Discovery uses saved video IDs to decide when to stop and checks both tabs on
+every run, including previously empty or absent tabs. No replacement flags are
+stored on `channels`, and `--initial-only` is no longer supported.
+
+Apply the migration to an existing database after updating the discovery code:
+
+```sh
+/opt/homebrew/opt/postgresql@18/bin/psql -X \
+  -h "$PWD/.local/postgres/socket" -U mahmud -d media \
+  -v ON_ERROR_STOP=1 --single-transaction \
+  -f db/migrations/010_drop_channel_scan_state.sql
+```
+
+Fresh databases use `db/schema.sql`, which contains no initialization table.
+Migration 003 remains in the migration history for older databases.
 
 ## Upgrade
 

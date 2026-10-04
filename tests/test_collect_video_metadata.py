@@ -668,7 +668,9 @@ class MetadataDatabaseTests(unittest.TestCase):
             "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='videos'"
         )}
         self.assertEqual(columns, {"video_id", "channel_id", "type", "title", "description",
-                                   "duration_seconds", "published_at", "thumbnail_url", "metadata_updated_at", "metadata_error"})
+                                   "duration_seconds", "published_at", "thumbnail_url", "metadata_updated_at", "metadata_error",
+                                   "view_count", "like_count", "stats_updated_at", "stats_error",
+                                   "comments_updated_at", "comments_error"})
 
     def test_valid_partial_metadata_is_saved_with_a_timestamp(self):
         data = {"playabilityStatus": {"status": "UNPLAYABLE"},

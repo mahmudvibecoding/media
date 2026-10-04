@@ -19,6 +19,7 @@ import httpx
 import psycopg
 
 from collect_subscribers import CLIENT_VERSION, ROOT, positive_int
+from collection_policy import video_error_reason
 from discover_videos import open_database
 from proxy_statistics import AttemptOutcome, ProxyStatistics, proxy_connection_error
 from proxy_catalog import CatalogClients, DEFAULT_BRIDGE_BINARY, SUPPORTED_PROTOCOLS, load_catalog
@@ -319,13 +320,16 @@ async def fetch_metadata(client, video_id, client_version=CLIENT_VERSION, retrie
         finally:
             if on_attempt is not None and not excluded:
                 try:
+                    video_error = (video_error_reason({**result, 'video_id': video_id})
+                                   if not has_metadata(result) and not connection_error else None)
                     on_attempt(AttemptOutcome(
                         checked_at=datetime.now(timezone.utc),
                         request_sent=trace.request_sent or result.get('http_status') is not None,
-                        http_status=result.get('http_status'), data_received=has_metadata(result),
+                        http_status=result.get('http_status'), data_received=None if video_error else has_metadata(result),
                         connected=True if trace.request_sent or result.get('http_status') is not None else trace.connected,
                         connection_error=proxy_connection_error(connection_error),
-                        website_error=youtube_error_label(result, connection_error)))
+                        website_error=('video:' + video_error.lower()) if video_error else
+                                      youtube_error_label(result, connection_error)))
                 except Exception:
                     pass
         if has_metadata(result):
