@@ -100,6 +100,11 @@ host network and PostgreSQL binds to `127.0.0.1:55432`. Set `MEDIA_DB_HOST_PORT`
 that port is already used. Database memory and WAL settings can be adjusted with
 `MEDIA_DB_SHARED_BUFFERS` and `MEDIA_DB_MAX_WAL_SIZE`.
 
+Large Linux sweeps also need enough connection-tracking capacity. The 52-core
+server uses `net.netfilter.nf_conntrack_max=8388608`; its former 262144 limit
+dropped packets during the sweep. Size this host setting for the server's memory
+and check kernel logs for dropped packets before trusting a test run.
+
 The catalog publisher remains independent.
 
 The [earlier deployment verification](docs/proxy-service-verification-20261004.json)

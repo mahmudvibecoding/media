@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"sort"
@@ -55,7 +56,7 @@ func scoreOne(ctx context.Context, input Candidate, options Options, runID strin
 		}
 		for _, attempt := range result.Attempts {
 			if strings.HasPrefix(attempt.ErrorCode, "local_") {
-				out.Err = errors.New("local resource overload; no final scores published")
+				out.Err = fmt.Errorf("local resource overload (%s); no final scores published", attempt.ErrorCode)
 				return out
 			}
 		}
@@ -159,7 +160,9 @@ func score(args []string) (int, error) {
 				break
 			}
 			if result.Err != nil {
-				runError = result.Err
+				if runError == nil {
+					runError = result.Err
+				}
 				cancel()
 				continue
 			}

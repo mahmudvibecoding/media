@@ -71,7 +71,11 @@ def test_catalog(home, settings, stop, status, owner):
                     if code:
                         raise RuntimeError(f"Proxy scorer exited with status {code}")
                     return json.loads(summary)
-                except BaseException:
+                except BaseException as exc:
+                    try:
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
                     if process.poll() is None:
                         try:
                             os.killpg(process.pid, signal.SIGTERM)
@@ -82,6 +86,8 @@ def test_catalog(home, settings, stop, status, owner):
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
+                    if isinstance(exc, BrokenPipeError):
+                        raise RuntimeError(f"Proxy scorer stopped with exit status {process.returncode}") from exc
                     raise
 
         reports = []
