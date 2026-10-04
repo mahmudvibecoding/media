@@ -8,15 +8,22 @@ from proxy_formats import unpack_connection_settings
 from runtime_config import connect_database
 
 
-def load_inventory(limit=0):
+def load_inventory(limit=0, channel_ids=None):
     with connect_database('media') as conn:
         conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-        channels = [r[0] for r in conn.execute(
-            'SELECT channel_id FROM public.channels ORDER BY channel_id LIMIT %s', (limit or None,))]
+        if channel_ids:
+            channels = [r[0] for r in conn.execute(
+                'SELECT channel_id FROM public.channels WHERE channel_id=ANY(%s) ORDER BY channel_id',
+                (channel_ids,))]
+            if set(channels) != set(channel_ids):
+                raise ValueError('A requested channel is not in the saved channels table')
+        else:
+            channels = [r[0] for r in conn.execute(
+                'SELECT channel_id FROM public.channels ORDER BY channel_id LIMIT %s', (limit or None,))]
         known = defaultdict(set)
         with conn.cursor(name='discovery_existing_ids') as cursor:
             cursor.itersize = 25000
-            if limit:
+            if limit or channel_ids:
                 cursor.execute('SELECT channel_id,type,video_id FROM public.videos WHERE channel_id=ANY(%s)',
                                (channels,))
             else:

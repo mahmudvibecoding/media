@@ -179,8 +179,10 @@ class DiscoveryParsingTests(unittest.TestCase):
         payload = page(items=[{"continuationItemRenderer": {"continuationEndpoint": {
             "continuationCommand": {"token": "token"}
         }}}])
-        with self.assertRaises(ResponseShapeError):
-            parse_page(payload, CHANNEL, "video")
+        result = parse_page(payload, CHANNEL, "video")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["continuation"], "token")
+        self.assertFalse(result["complete_tab"])
 
 
 class DiscoveryHTTPTests(unittest.IsolatedAsyncioTestCase):

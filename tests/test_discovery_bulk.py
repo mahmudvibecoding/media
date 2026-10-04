@@ -20,7 +20,7 @@ from database_helpers import connect_test_database
 from discover_all import COUNTERS, collect, fetch_using_pool, parser, run_worker
 from discover_videos import scan_tab
 from discovery_pool import ConcurrencyTuner, DiscoveryPool, Performance
-from discovery_storage import BatchWriter, load_ranked_proxies
+from discovery_storage import BatchWriter, load_inventory, load_ranked_proxies
 
 
 def ranking(count):
@@ -267,6 +267,16 @@ class WriterDatabaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.writer.write([scan])
         self.assertEqual(self.conn.execute('SELECT count(*) FROM public.videos WHERE channel_id=%s',(self.channel,)).fetchone()[0],0)
+
+    def test_inventory_can_target_saved_channels_and_rejects_unknown_channels(self):
+        video = uuid.uuid4().hex[:11]
+        self.writer.write([self.scan([video])])
+        with patch('discovery_storage.connect_database',side_effect=lambda _:connect_test_database('media')):
+            channels,known = load_inventory(channel_ids=[self.channel,self.channel])
+            self.assertEqual(channels,[self.channel])
+            self.assertEqual(known,{(self.channel,'video'):{video}})
+            with self.assertRaises(ValueError):
+                load_inventory(channel_ids=['UC'+uuid.uuid4().hex[:22]])
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Exercise the Linux forked collection controller')
     def test_process_controller_drains_results_and_publishes_only_committed_ids(self):

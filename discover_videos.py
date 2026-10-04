@@ -115,8 +115,6 @@ def parse_items(items, channel_id, video_type):
         if ids[0] not in seen:
             seen.add(ids[0])
             videos.append({"video_id": ids[0], "channel_id": channel_id, "type": video_type})
-    if not videos and token:
-        raise ResponseShapeError("Pagination without any video cards")
     return videos, token
 
 
@@ -132,7 +130,7 @@ def parse_continuation(payload, channel_id, video_type):
     if len(batches) != 1:
         raise ResponseShapeError("Missing or ambiguous continuation items")
     videos, token = parse_items(batches[0], channel_id, video_type)
-    return {"status": "ok" if videos else "empty", "videos": videos, "continuation": token,
+    return {"status": "ok" if videos or token else "empty", "videos": videos, "continuation": token,
             "latest_verified": True, "complete_tab": token is None, "alerts": []}
 
 
@@ -198,9 +196,7 @@ def parse_page(payload, channel_id, video_type):
         pass
     else:
         raise SortNotVerified(f"Latest ordering not verified; selected sort: {selected}")
-    if not result["videos"]:
-        if result["continuation"]:
-            raise ResponseShapeError("Pagination without any video cards")
+    if not result["videos"] and not result["continuation"]:
         result["status"] = "empty"
     return result
 

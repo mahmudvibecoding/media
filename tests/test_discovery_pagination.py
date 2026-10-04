@@ -90,6 +90,31 @@ class ContinuationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(payload=payload), self.assertRaises(ResponseShapeError):
                 parse_continuation(payload, "channel", "video")
 
+    async def test_listing_link_without_cards_is_followed_before_completion(self):
+        responses = {None:first_page([], 'load-cards'),
+                     'load-cards':next_page(['RtXBV0X1v1Q'])}
+        requested = []
+        def respond(request):
+            token = json.loads(request.content).get('continuation')
+            requested.append(token)
+            return httpx.Response(200,json=responses[token])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            result = await scan_tab(client,None,'channel','video',known_ids=set(),persist=False)
+        self.assertEqual(requested,[None,'load-cards'])
+        self.assertTrue(result['scan_complete'])
+        self.assertEqual(result['pages_fetched'],2)
+        self.assertEqual([v['video_id'] for v in result['videos']],['RtXBV0X1v1Q'])
+
+    async def test_repeated_listing_link_does_not_complete_an_empty_scan(self):
+        def respond(request):
+            token = json.loads(request.content).get('continuation')
+            return httpx.Response(200,json=first_page([], 'loop') if token is None else next_page([], 'loop'))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            result = await scan_tab(client,None,'channel','video',known_ids=set(),persist=False)
+        self.assertFalse(result['scan_complete'])
+        self.assertEqual(result['status'],'pagination_loop')
+        self.assertEqual(result['videos_inserted'],0)
+
 
 @unittest.skipUnless(os.environ.get("MEDIA_TEST_DATABASE_URL"), "Set MEDIA_TEST_DATABASE_URL for database tests")
 class PaginationDatabaseTests(unittest.IsolatedAsyncioTestCase):

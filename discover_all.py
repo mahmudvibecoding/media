@@ -183,7 +183,7 @@ def collect(options):
     folder = options.output or OUTPUT_DIR/('discovery-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+run_id[:8])
     folder.mkdir(parents=True, exist_ok=False)
     emit('loading', run_id=run_id, output_directory=str(folder))
-    channels, known = load_inventory(options.limit)
+    channels, known = load_inventory(options.limit, options.channel_id)
     proxies, ranks = load_ranked_proxies(options.ranked)
     jobs = select_tabs(channels)
     cpus = getattr(os, 'process_cpu_count', os.cpu_count)() or 2
@@ -388,7 +388,9 @@ def collect(options):
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument('--ranked', type=Path, default=STATE_DIR/'proxy-service/ranked-proxies.jsonl')
-    result.add_argument('--limit', type=int, default=0, help='Channel limit; zero scans every saved channel')
+    selection = result.add_mutually_exclusive_group()
+    selection.add_argument('--limit', type=int, default=0, help='Channel limit; zero scans every saved channel')
+    selection.add_argument('--channel-id', action='append', help='One saved channel; repeat to select several')
     result.add_argument('--workers', type=int, default=0, help='Zero chooses processes from available CPUs')
     result.add_argument('--concurrency', type=int, default=0, help='Zero automatically tunes concurrency')
     result.add_argument('--max-concurrency', type=int, default=0, help='Zero permits one request per ranked proxy')

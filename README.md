@@ -94,6 +94,10 @@ For a bounded benchmark or a fixed concurrency:
 sh scripts/collect-new-videos.sh --limit 1000 --concurrency 512
 ```
 
+Use `--channel-id CHANNEL_ID`, repeated as needed, to retry selected saved channels.
+Listings containing only a continuation link are followed before the scan can
+finish; repeated tokens still fail the scan without saving partial IDs.
+
 ### Manual proxy testing
 
 From the application directory, run:
