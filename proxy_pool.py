@@ -213,7 +213,7 @@ def import_test_journal(conn, path, *, retest_seconds=21600):
                               retest_seconds=retest_seconds, _staged=True, _retry_delays=retry_delays)
 
 
-def export_due(conn, folder, *, limit=2000, now=None):
+def export_due(conn, folder, *, limit=2000, now=None, after_id=None, max_id=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=False, mode=0o700)
     now = now or utcnow()
@@ -224,30 +224,39 @@ def export_due(conn, folder, *, limit=2000, now=None):
     with conn.transaction(), conn.cursor(name="proxy_due_export") as cursor, source.open("w", buffering=1024*1024) as output:
         os.chmod(source, 0o600)
         cursor.itersize = 10000
-        cursor.execute("""SELECT p.proxy_id,p.connection_key,p.address,p.port,p.connection_settings
+        if after_id is not None:
+            cursor.execute("""SELECT proxy_id,connection_key,address,port,connection_settings
+                FROM public.proxies WHERE proxy_id>%s AND proxy_id<=%s
+                ORDER BY proxy_id LIMIT %s""", (after_id, max_id, limit))
+        else:
+            cursor.execute("""SELECT p.proxy_id,p.connection_key,p.address,p.port,p.connection_settings
             FROM app_meta.proxy_test_state q JOIN public.proxies p USING(proxy_id)
             WHERE q.next_test_at<=%s ORDER BY q.next_test_at,q.proxy_id LIMIT %s""", (now, limit))
+        last_id = None
         for identifier, key, address, port, settings in cursor:
             transport, options = unpack_connection_settings(settings)
             output.write(json.dumps({"id": identifier, "key": bytes(key).hex(), "address": address,
                 "port": port, "protocol": transport, "settings": options}, separators=(",", ":")) + "\n")
             count += 1
+            last_id = identifier
         output.flush()
         os.fsync(output.fileno())
     if not count:
         source.unlink()
         folder.rmdir()
         return None
-    manifest = {"schema_version": 1, "records": count, "shards": [
+    manifest = {"schema_version": 1, "records": count, "last_proxy_id": last_id, "shards": [
         {"file": source.name, "records": count, "bytes": source.stat().st_size, "sha256": digest(source)}]}
     write_json(folder / "manifest.json", manifest)
     return manifest
 
 
-def ranked_rows(conn, *, limit=4096, max_age_seconds=86400):
+def ranked_rows(conn, *, limit=0, max_age_seconds=86400):
     if limit < 0 or max_age_seconds <= 0:
         raise ValueError("Invalid pool limits")
-    return conn.execute("""SELECT h.proxy_id,encode(p.connection_key,'hex'),h.working_protocol,
+    with conn.transaction(), conn.cursor(name="ranked_pool_export") as cursor:
+        cursor.itersize = 10000
+        cursor.execute("""SELECT h.proxy_id,encode(p.connection_key,'hex'),h.working_protocol,
             coalesce(h.youtube_score,50)/(1+q.failure_streak) AS rank_score,
             h.youtube_successful_data_received,h.youtube_responses_received,
             q.last_response_at,q.latency_ms,h.youtube_last_http_status
@@ -258,9 +267,10 @@ def ranked_rows(conn, *, limit=4096, max_age_seconds=86400):
         ORDER BY rank_score DESC,h.youtube_weighted_successful_data_received DESC,
             q.latency_ms ASC NULLS LAST,q.last_response_at DESC,h.proxy_id
         LIMIT %s""", (max_age_seconds, limit or None))
+        yield from cursor
 
 
-def export_pool(conn, home=SERVICE_DIR, *, limit=4096, max_age_seconds=86400):
+def export_pool(conn, home=SERVICE_DIR, *, limit=0, max_age_seconds=86400):
     """Export IDs and ranks; connection credentials remain in the private database."""
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True, mode=0o700)

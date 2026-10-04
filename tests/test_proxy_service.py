@@ -442,3 +442,83 @@ class DatabaseTests(unittest.TestCase):
         apply_observations(self.live, [self.observation(1, data=True, seconds=1)], b's'*32, 'scored', quality=True)
         self.assertEqual(self.live.execute('SELECT connection_attempts,youtube_successful_data_received,youtube_weighted_attempts,youtube_weighted_successful_data_received FROM public.proxy_stats').fetchone(), (2,1,1.0,1.0))
         self.assertEqual(self.live.execute('SELECT quality_checked_at FROM app_meta.proxy_test_state').fetchone()[0], self.at+timedelta(seconds=1))
+
+    def test_manual_three_passes_resume_on_both_sides_of_progress_commit(self):
+        self.seed(self.live, 3)
+        self.live.execute("INSERT INTO app_meta.proxy_test_state(proxy_id,next_test_at) SELECT proxy_id,clock_timestamp()+interval '1 day' FROM public.proxies")
+        def connect(*args, **kwargs):
+            return psycopg.connect(**{**self.options, 'dbname': self.names[0]}, autocommit=True)
+        checked = []
+        def tester(command, **kwargs):
+            path = Path(command[command.index('--output')+1])
+            manifest = Path(command[command.index('--input')+1])
+            run_id = command[command.index('--run-id')+1]
+            inputs = [json.loads(line) for line in (manifest.parent/'input.jsonl').read_text().splitlines()]
+            rows = []
+            for item in inputs:
+                checked.append(item['id'])
+                rows.append({'id':item['id'], 'key':item['key'], 'declared_protocol':'http', 'detected_protocol':'http',
+                    'tested_at':utcnow().isoformat(), 'status':'responds', 'attempted':True, 'responds':True, 'total_ms':20,
+                    'attempts':[{'protocol':'http', 'status':'responds', 'http_status':403, 'tls_verified':True,
+                                 'connected':True, 'request_sent':True, 'body_complete':True}]})
+            path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+            Path(str(path)+'.meta.json').write_text(json.dumps({'run_id':run_id,'input_sha256':digest(manifest)}))
+            Path(str(path)+'.summary.json').write_text(json.dumps({'state':'complete','counters':
+                {'completed':len(rows),'attempted':len(rows),'youtube_responses':len(rows)}}))
+            return 0
+        settings = Settings(batch_size=2, test_concurrency=2)
+        stop = threading.Event()
+        status = service.Status(self.folder, stop)
+        write = service.write_json
+        def interrupted_write(path, value, *, after):
+            if Path(path).name == 'current-refresh.json' and value['observations'] == 2:
+                if after:
+                    write(path, value)
+                raise RuntimeError('injected progress interruption')
+            return write(path, value)
+        with patch.object(service, 'connect_database', side_effect=connect), \
+                patch.object(service, 'synchronize', return_value={'already_imported':True}) as sync_call, \
+                patch.object(service, 'run_owned', side_effect=tester):
+            for after in (False, True):
+                with patch.object(service, 'write_json', side_effect=lambda p,v: interrupted_write(p,v,after=after)):
+                    with self.assertRaisesRegex(RuntimeError, 'progress interruption'):
+                        service.refresh(self.folder, settings, stop, status, self.live)
+                self.assertEqual(checked, [1,2])
+            # Add a proxy after the catalog was selected; it belongs to the next invocation.
+            proxy = Proxy('203.0.113.4', 8080, 'http', {})
+            self.live.execute('INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at) VALUES (%s,%s,%s,%s,clock_timestamp())',
+                (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
+            result = service.refresh(self.folder, settings, stop, status, self.live)
+            self.assertEqual(sync_call.call_count, 1)
+        self.assertEqual(checked, [1,2,3]*3)
+        self.assertEqual(result['passes_completed'], 3)
+        self.assertEqual(result['observations'], 9)
+        self.assertEqual(result['pool']['exported'], 3)
+        self.assertFalse((self.folder/'current-refresh.json').exists())
+        self.assertEqual(self.live.execute('SELECT proxy_id,connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall(), [(1,3),(2,3),(3,3)])
+
+    def test_default_pool_exports_more_than_4096_responders(self):
+        self.live.execute("""INSERT INTO public.proxies(connection_key,address,port,last_seen_at)
+            SELECT decode(lpad(to_hex(n),64,'0'),'hex'),'127.0.0.1',n,clock_timestamp()
+            FROM generate_series(1,4100) n""")
+        self.live.execute("INSERT INTO public.proxy_stats(proxy_id,working_protocol) SELECT proxy_id,'http' FROM public.proxies")
+        self.live.execute("INSERT INTO app_meta.proxy_test_state(proxy_id,last_response_at) SELECT proxy_id,clock_timestamp() FROM public.proxies")
+        report = export_pool(self.live, self.folder)
+        self.assertEqual(report['exported'], 4100)
+        self.assertEqual(report['limit'], 0)
+        self.assertEqual(len((self.folder/'ranked-proxies.jsonl').read_text().splitlines()), 4100)
+
+    def test_real_go_manual_command_completes_three_passes(self):
+        if not service.BRIDGE_BINARY.is_file():
+            self.skipTest('Build the Go tester before running this integration check')
+        proxy = Proxy('127.0.0.1', 1, 'http', {})
+        self.live.execute('INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at) VALUES (%s,%s,%s,%s,clock_timestamp())',
+            (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
+        def connect(*args, **kwargs):
+            return psycopg.connect(**{**self.options, 'dbname': self.names[0]}, autocommit=True)
+        stop = threading.Event()
+        with patch.object(service, 'connect_database', side_effect=connect), patch.object(service, 'synchronize', return_value={}):
+            result = service.refresh(self.folder, Settings(batch_size=1,test_concurrency=1,connect_timeout=1,request_timeout=1),
+                                     stop,service.Status(self.folder,stop),self.live)
+        self.assertEqual(result['observations'], 3)
+        self.assertEqual(self.live.execute('SELECT connection_attempts FROM public.proxy_stats').fetchone()[0], 3)

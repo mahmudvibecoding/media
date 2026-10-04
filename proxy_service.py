@@ -97,7 +97,7 @@ def event(kind, **fields):
     print(json.dumps({"event": kind, "at": utcnow(), **fields}, default=str), flush=True)
 
 
-def test_batch(home, settings, stop, status):
+def test_batch(home, settings, stop, status, *, after_id=None, max_id=None, retain_checkpoint=False):
     started = time.monotonic()
     home = Path(home)
     checkpoint = home / "current-test.json"
@@ -106,12 +106,15 @@ def test_batch(home, settings, stop, status):
         run_id = str(uuid.uuid4())
         folder = home / "runs" / run_id
         with connect_database("proxy", autocommit=True) as conn:
-            manifest = export_due(conn, folder, limit=settings.batch_size)
+            manifest = export_due(conn, folder, limit=settings.batch_size, after_id=after_id, max_id=max_id)
         if manifest is None:
             return None
         current = {"run_id": run_id, "manifest_sha256": digest(folder / "manifest.json"),
-                   "settings": asdict(settings), "phase": "testing"}
+                   "settings": asdict(settings), "phase": "testing",
+                   "after_id": after_id, "max_id": max_id, "last_proxy_id": manifest["last_proxy_id"]}
         write_json(checkpoint, current)
+    if current.get("after_id") != after_id or current.get("max_id") != max_id:
+        raise ValueError("Saved batch belongs to a different catalog range")
     if str(uuid.UUID(current["run_id"])) != current["run_id"]:
         raise ValueError("Invalid saved test run")
     folder = home / "runs" / current["run_id"]
@@ -155,10 +158,69 @@ def test_batch(home, settings, stop, status):
     report["seconds"] = {"prepare": round(exported-started, 2), "test": round(tested-exported, 2),
                          "import": round(time.monotonic()-tested, 2), "total": round(time.monotonic()-started, 2)}
     write_json(folder / "completed.json", {**report, "completed_at": utcnow().isoformat()})
-    checkpoint.unlink()
+    if not retain_checkpoint:
+        checkpoint.unlink()
     status.update(last_test=report)
     event("proxy_test_imported", run_id=current["run_id"], **report)
     return report
+
+
+def refresh(home, settings, stop, status, owner):
+    """One fixed catalog, three complete passes, with durable batch progress."""
+    home = Path(home)
+    checkpoint = home / "current-refresh.json"
+    current = read_json(checkpoint)
+    for previous in (home / "manual-runs").glob("*"):
+        if previous.is_dir() and not previous.is_symlink():
+            clean_completed(previous, settings.journal_retention)
+    if current is None:
+        status.update(state="syncing")
+        catalog = synchronize(settings.repository, home=home, stop=stop)
+        if stop.is_set():
+            raise InterruptedError("Catalog update stopped; invoke the command to resume")
+        with connect_database("proxy", autocommit=True) as conn:
+            maximum, count = conn.execute("SELECT coalesce(max(proxy_id),0),count(*) FROM public.proxies").fetchone()
+        current = {"run_id": str(uuid.uuid4()), "started_at": utcnow().isoformat(),
+                   "catalog": catalog, "max_id": maximum, "configurations": count,
+                   "pass": 1, "after_id": 0, "observations": 0, "last_batch": None}
+        write_json(checkpoint, current)
+    batch_home = home / "manual-runs" / current["run_id"]
+    batch_home.mkdir(parents=True, exist_ok=True)
+    batch_checkpoint = batch_home / "current-test.json"
+    while current["pass"] <= 3:
+        if stop.is_set():
+            raise InterruptedError("Progress saved; invoke the command to resume")
+        owner.execute("SELECT 1")
+        saved = read_json(batch_checkpoint)
+        # The cursor may already be committed when checkpoint deletion is interrupted.
+        if saved and saved["run_id"] == current["last_batch"]:
+            batch_checkpoint.unlink()
+        status.update(pass_number=current["pass"], configurations=current["configurations"],
+                      observations=current["observations"])
+        report = test_batch(batch_home, settings, stop, status, after_id=current["after_id"],
+                            max_id=current["max_id"], retain_checkpoint=True)
+        if report is None:
+            event("proxy_pass_completed", pass_number=current["pass"], configurations=current["configurations"])
+            current.update({"pass": current["pass"] + 1, "after_id": 0})
+        else:
+            saved = read_json(batch_checkpoint)
+            current.update(after_id=saved["last_proxy_id"], last_batch=saved["run_id"],
+                           observations=current["observations"] + report["observations"])
+        write_json(checkpoint, current)
+        if report is not None:
+            batch_checkpoint.unlink()
+        with connect_database("proxy", autocommit=True) as conn:
+            export_pool(conn, home)
+        clean_completed(batch_home, settings.journal_retention)
+    if current["observations"] != current["configurations"] * 3:
+        raise RuntimeError("Catalog changed during the run; saved counts require inspection")
+    with connect_database("proxy", autocommit=True) as conn:
+        pool = export_pool(conn, home)
+    result = {**current, "passes_completed": 3, "pool": pool, "completed_at": utcnow().isoformat(),
+              "seconds": round((utcnow()-datetime.fromisoformat(current["started_at"])).total_seconds(), 2)}
+    write_json(home / "last-refresh.json", result)
+    checkpoint.unlink()
+    return result
 
 
 def read_quality(path):
@@ -381,7 +443,7 @@ def serve(home, settings, stop, status, owner):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("run", "sync", "test", "pool", "status", "health"))
+    parser.add_argument("command", choices=("run", "refresh", "sync", "test", "pool", "status", "health"))
     parser.add_argument("--home", type=Path, default=SERVICE_DIR)
     parser.add_argument("--limit", type=int, help="Number of due proxies in a manual test batch")
     parser.add_argument("--concurrency", type=int)
@@ -430,7 +492,15 @@ def main():
             SELECT p.proxy_id FROM public.proxies p WHERE NOT EXISTS
               (SELECT 1 FROM app_meta.proxy_test_state q WHERE q.proxy_id=p.proxy_id)
             ON CONFLICT DO NOTHING""")
-        if args.command == "test":
+        if args.command == "refresh":
+            status.thread.start()
+            try:
+                print(json.dumps(refresh(args.home, settings, stop, status, owner), default=str))
+            finally:
+                stop.set()
+                status.thread.join(timeout=6)
+                write_json(args.home / "service-status.json", {"state": "stopped", "heartbeat_at": time.time()})
+        elif args.command == "test":
             result = test_batch(args.home, settings, stop, status)
             quality_batch(args.home, settings, stop, status)
             with connect_database("proxy", autocommit=True) as conn:

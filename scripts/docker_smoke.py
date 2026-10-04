@@ -24,6 +24,9 @@ from discover_videos import scan_tab
 from manage import add_channels
 from metadata_bulk import atomic_json, claim, connect_queue, digest, export_events, finish, initialize, queue_status
 from proxy_statistics import AttemptOutcome
+from proxy_formats import Proxy, pack_connection_settings
+from proxy_service_common import SERVICE_DIR, read_json, write_json, utcnow
+from psycopg.types.json import Jsonb
 from runtime_config import OUTPUT_DIR, STATE_DIR, connect_database
 from test_collect_video_comments import page as comment_page
 from test_collect_video_metadata import payload as metadata_payload
@@ -33,6 +36,32 @@ from test_video_stats import VIDEO, payload as statistics_payload
 CHANNEL = 'UC' + 'd' * 22
 PROXY_KEY = hashlib.sha256(b'docker-smoke-fixture').digest()
 REPORT = OUTPUT_DIR / 'docker-smoke.json'
+
+
+def prepare_manual_proxies():
+    # A saved catalog selection exercises the real shell command without GitHub
+    # downloads or public-network traffic in this disposable verification project.
+    with connect_database('proxy') as conn:
+        assert conn.execute('SELECT count(*) FROM public.proxies').fetchone()[0] == 0
+        for port in (1, 2):
+            proxy = Proxy('127.0.0.1', port, 'http', {})
+            conn.execute('''INSERT INTO public.proxies(connection_key,address,port,connection_settings,last_seen_at)
+                VALUES (%s,%s,%s,%s,clock_timestamp())''',
+                (proxy.key,proxy.address,proxy.port,Jsonb(pack_connection_settings(proxy.protocol,proxy.settings))))
+        maximum = conn.execute('SELECT max(proxy_id) FROM public.proxies').fetchone()[0]
+    write_json(SERVICE_DIR/'current-refresh.json', {'run_id':str(uuid.uuid4()), 'started_at':utcnow().isoformat(),
+        'catalog':{'fixture':True}, 'max_id':maximum, 'configurations':2, 'pass':1,
+        'after_id':0, 'observations':0, 'last_batch':None})
+
+
+def verify_manual_proxies():
+    assert not (SERVICE_DIR/'current-refresh.json').exists()
+    report = read_json(SERVICE_DIR/'last-refresh.json')
+    assert report['passes_completed'] == 3 and report['observations'] == 6
+    assert report['pool']['limit'] == 0
+    with connect_database('proxy') as conn:
+        assert conn.execute('SELECT connection_attempts FROM public.proxy_stats ORDER BY proxy_id').fetchall() == [(3,), (3,)]
+    print(json.dumps({'manual_proxy_command':'passed','configurations':2,'passes':3,'observations':6}))
 
 
 def snapshot():
@@ -125,8 +154,13 @@ async def collect():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('collect', 'verify'))
-    if parser.parse_args().command == 'collect':
+    parser.add_argument('command', choices=('collect', 'verify', 'prepare-proxies', 'verify-proxies'))
+    command = parser.parse_args().command
+    if command == 'prepare-proxies':
+        prepare_manual_proxies()
+    elif command == 'verify-proxies':
+        verify_manual_proxies()
+    elif command == 'collect':
         asyncio.run(collect())
     else:
         assert (STATE_DIR / 'docker-smoke-sentinel').read_text() == 'persistent state\n'

@@ -9,6 +9,7 @@ report_dir=$(mktemp -d "${TMPDIR:-/tmp}/media-docker-check.XXXXXXXX")
 COMPOSE_PROJECT_NAME=$(basename "$report_dir" | tr '[:upper:].' '[:lower:]-')
 export COMPOSE_PROJECT_NAME
 export MEDIA_PROXY_SERVICE_ENABLED=0
+export COMPOSE_PROFILES=automatic
 credentials="$report_dir/credentials.env"
 printf 'POSTGRES_PASSWORD=%s\nMEDIA_DB_PASSWORD=%s\n' \
   "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
@@ -43,8 +44,11 @@ if ! compose run --rm -e MEDIA_TEST_DATABASE_URL=dbname=media \
   exit 1
 fi
 tail -5 "$report_dir/python-tests.log"
+compose run --rm backend python scripts/docker_smoke.py prepare-proxies
+COMPOSE_ENV_FILES="$credentials" sh scripts/update-proxies.sh
+compose run --rm backend python scripts/docker_smoke.py verify-proxies
 compose run --rm backend python scripts/docker_smoke.py collect
 compose down
 compose up -d
 compose run --rm backend python scripts/docker_smoke.py verify
-echo "Docker verification passed: tests, fixture collection, replay, and persistent storage."
+echo "Docker verification passed: tests, manual three-pass command, fixture collection, replay, and persistent storage."

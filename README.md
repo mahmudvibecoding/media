@@ -22,8 +22,9 @@ sh scripts/setup.sh
 
 The script creates private credentials in `.env`, builds the Python collectors
 and Go proxy tester, starts PostgreSQL, and initializes the `media` and `proxy`
-databases, then starts the automatic proxy service. The final status command waits for database setup to finish. You do
-not need Python, Go, or PostgreSQL installed on the host.
+databases. Proxy importing and testing start when you run the manual command
+below. The final status command waits for database setup to finish. You do not
+need Python, Go, or PostgreSQL installed on the host.
 
 Add a channel and collect its uploads and metadata:
 
@@ -46,64 +47,61 @@ The YouTube database starts empty. To explicitly import all bundled channel IDs:
 docker compose run --rm backend python manage.py import-channels
 ```
 
-### Automatic proxy catalog and working pool
+### Manual proxy catalog update and three test passes
 
-Setup starts `proxy-service`, which downloads the latest published snapshot from
-[proxy-catalog](https://github.com/mahmudvibecoding/proxy-catalog), verifies its
-checksums, restores it to `proxy_stage`, and checks every table's row count and
-content fingerprint before merging it. Updates preserve proxy IDs and existing
-server statistics. A failed update leaves the current catalog usable; interrupted
-downloads and tests resume from saved checkpoints.
+From the application directory, run:
 
-The Go tester continuously checks new and due configurations. **Any verified
-YouTube HTTP response qualifies for the working pool**, including sign-in
-challenges, HTTP errors, and responses whose body times out. Separate metadata
-probes measure usable data: repeated successful data retrieval ranks higher.
-Ranking also considers recent failures and response time. Pool entries expire
-24 hours after their last verified response.
+```sh
+sh scripts/update-proxies.sh
+```
+
+This command checks the latest published [proxy catalog](https://github.com/mahmudvibecoding/proxy-catalog),
+verifies checksums and restored table fingerprints, and imports new configurations
+while preserving IDs and server statistics. It then tests **every configuration
+in that catalog three times**, in three complete passes, with **80,000 concurrent
+checks** and batches of up to one million. Recently tested proxies are included.
+A detected local resource overload reduces concurrency for the saved batch.
+
+Each invocation runs once and exits with a summary. Setup does not launch the
+background worker. The command runs in the foreground; keep the terminal session
+open until it finishes. If interrupted, invoke the same command to resume the
+saved run. Completed checks and committed imports are not repeated. A concurrent
+invocation fails without starting another run. A fresh run checks for a new
+catalog; a resumed run finishes its already selected catalog first.
+
+Any verified YouTube HTTP response qualifies for the working pool, including
+sign-in challenges and HTTP errors. The export contains **all qualifying proxies,
+ordered by score**, without a size limit. Ranking uses the saved data-retrieval
+history, recent failures, and response latency. These three reachability passes
+do not add separate metadata probes. Entries expire 24 hours after their last
+verified response.
+
+The ranked IDs and statistics are saved at
+`/var/lib/media/state/proxy-service/ranked-proxies.jsonl` in the shared state
+volume; connection settings remain in PostgreSQL. The final summary is saved as
+`last-refresh.json` beside it. Collectors can resolve these IDs through the
+catalog loader; automatic collector integration is a separate step.
 
 ```sh
 docker compose run --rm backend python proxy_service.py status
-docker compose logs --tail=30 proxy-service
-docker compose stop proxy-service       # Pause synchronization and tests
-docker compose start proxy-service      # Resume saved work
 ```
 
-The ranked pool is refreshed in the shared state volume at
-`/var/lib/media/state/proxy-service/ranked-proxies.jsonl`. It exports up to 4,096
-IDs with scores and response statistics; `status` reports the full responder
-count. Connection settings remain in PostgreSQL. Collectors can resolve these IDs
-through the existing proxy catalog loader.
+For large sweeps on Linux, set
+`COMPOSE_FILE=compose.yaml:compose.host-network.yaml` in `.env`. The tester uses the
+host network and PostgreSQL binds to `127.0.0.1:55432`. Set `MEDIA_DB_HOST_PORT` if
+that port is already used. Database memory and WAL settings can be adjusted with
+`MEDIA_DB_SHARED_BUFFERS` and `MEDIA_DB_MAX_WAL_SIZE`.
 
-Defaults check GitHub hourly and retest responding proxies every six hours.
-Failed connections retry with increasing delays; untested configurations run
-first. `MEDIA_PROXY_TEST_CONCURRENCY=0` chooses concurrency from CPU and memory
-limits, capped at 80,000. `MEDIA_PROXY_TEST_BATCH_SIZE=0` selects up to one million configurations per batch, keeping
-the tester busy between startup and the final timeout waits. Explicit positive values override these choices. A local resource overload
-reduces concurrency for the interrupted batch. Catalog updates, metadata probes,
-and pool exports run independently of the main test sweep.
+Interrupted downloads and unimported journals are preserved. Each invocation
+cleans imported journals older than the configured retention period (default one
+day). The two latest imported snapshot files are retained.
+The catalog publisher remains independent. The legacy background worker is
+available only through the explicit `automatic` Compose profile and is disabled
+by default; the manual command does not enable it.
 
-Large imports use bounded PostgreSQL sort memory and a larger WAL allowance to
-reduce repeated disk writes. `MEDIA_DB_SHARED_BUFFERS` and
-`MEDIA_DB_MAX_WAL_SIZE` can be increased for larger servers. Apply database
-settings with `docker compose up -d`.
-
-For large sweeps on Linux, add
-`COMPOSE_FILE=compose.yaml:compose.host-network.yaml` to `.env` and run
-`docker compose up -d`. This profile lets the tester use the host network and
-binds PostgreSQL to `127.0.0.1:55432`; set `MEDIA_DB_HOST_PORT` if that port is
-already used. Other backend commands keep using the private Compose network.
-
-Set service overrides in `.env` and run `docker compose up -d proxy-service`. See
-[.env.example](.env.example) for intervals and probe settings. Set
-`MEDIA_PROXY_SERVICE_ENABLED=0` before setup to leave automatic work disabled.
-Imported test journals are retained for one day, configurable with
-`MEDIA_PROXY_JOURNAL_RETENTION` in seconds. The two latest imported snapshot
-files are retained. Unfinished downloads and unimported journals are preserved.
-The independent catalog publisher continues to own source discovery and releases.
-
-See the [deployment verification and concurrency measurements](docs/proxy-service-verification-20261004.json)
-for the tested 80,000 setting, its throughput limits, and restart checks.
+The [earlier deployment verification](docs/proxy-service-verification-20261004.json)
+records the concurrency benchmarks and background-service checks before this
+manual workflow was introduced.
 
 ### Storage, restart, and updates
 
