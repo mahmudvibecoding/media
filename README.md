@@ -102,6 +102,9 @@ Imported test journals are retained for one day, configurable with
 files are retained. Unfinished downloads and unimported journals are preserved.
 The independent catalog publisher continues to own source discovery and releases.
 
+See the [deployment verification and concurrency measurements](docs/proxy-service-verification-20261004.json)
+for the tested 80,000 setting, its throughput limits, and restart checks.
+
 ### Storage, restart, and updates
 
 Three named volumes preserve PostgreSQL data, collector state, and output files.

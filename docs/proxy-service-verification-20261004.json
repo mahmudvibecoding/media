@@ -1,0 +1,66 @@
+{
+  "verified_date_utc": "2026-10-04",
+  "implementation_commit": "2403729",
+  "selected_concurrency": 80000,
+  "selected_batch_size": 1000000,
+  "selection_reason": "User requested keeping 80000 after comparing both benchmark runs.",
+  "benchmark": {
+    "sample_sha256": "7bb34d2896cc886639c93373fe80254480f45efee0a81d3ff1dcf6e9cae55638",
+    "network_mode": "Linux host network",
+    "runs": [
+      {
+        "concurrency": 80000,
+        "active_checks_per_second": 25690.23,
+        "completed": 999653,
+        "attempted": 998278,
+        "youtube_responses": 3011,
+        "local_errors": 0,
+        "peak_tester_rss_kib": 6239544
+      },
+      {
+        "concurrency": 160000,
+        "active_checks_per_second": 28461.4,
+        "completed": 999268,
+        "attempted": 997893,
+        "youtube_responses": 2809,
+        "local_errors": 0,
+        "peak_tester_rss_kib": 7982244
+      }
+    ],
+    "limitations": [
+      "Active check rates exclude startup, the final timeout waits, and database import.",
+      "These are separate runs over the same sample; proxy availability can change between runs.",
+      "Reachability tests do not establish successful YouTube data retrieval. Separate metadata probes supply that ranking signal.",
+      "The sample does not represent every later batch in the full catalog."
+    ]
+  },
+  "verification": {
+    "python_tests_passed": 395,
+    "python_test_seconds": 55.659,
+    "docker_fixture_collection": "passed",
+    "docker_import_replay": "passed",
+    "docker_restart_storage_preservation": "passed",
+    "host_network_profile": "393 tests plus fixture collection and restart checks passed before the final two regression tests were added",
+    "live_restart": {
+      "result": "passed",
+      "run_before_and_after": "51741818-a045-4bed-9d73-aafecd2b6867",
+      "concurrency_before_and_after": 80000
+    },
+    "first_data_score_after_reachability": "Regression test passed; saved live metadata observations imported after the fix."
+  },
+  "deployment": {
+    "catalog_configurations": 6566643,
+    "catalog_lists": 14487,
+    "automatic_catalog_sync": true,
+    "automatic_testing": true,
+    "database_port_scope": "host loopback",
+    "initial_catalog_import_seconds": {
+      "download": 2.18,
+      "restore": 28.15,
+      "merge": 1393.73
+    },
+    "initial_import_note": "First import used the earlier database settings and overlapped verification workloads; this is an observed duration, not a tuned throughput benchmark.",
+    "working_pool_rule": "Any verified YouTube HTTP response qualifies. Repeated usable data retrieval improves ranking.",
+    "full_catalog_sweep": "running"
+  }
+}
