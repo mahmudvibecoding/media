@@ -70,6 +70,18 @@ class ParseTests(unittest.TestCase):
         with self.assertRaises(ResponseShapeError):
             count('not a number subscribers','subscribers')
 
+    def test_bare_domain_destinations_preserve_the_youtube_redirect(self):
+        for url in ('https://www.youtube.com/redirect?q=www.cooperation.uz',
+                    '/redirect?q=www.cooperation.uz', '/redirect?q=mailto%3Ahello%40example.com'):
+            with self.subTest(url=url):
+                payload=about()
+                item=payload['onResponseReceivedEndpoints'][0]['aboutChannelViewModel']
+                item['links']=[{'channelExternalLinkViewModel':{
+                    'title':{'content':'Contact'},'urlEndpoint':{'url':url}}}]
+                result=parse_about(payload,CHANNEL,parse_overview(overview(),CHANNEL))
+                expected='https://www.youtube.com'+url if url.startswith('/') else url
+                self.assertEqual(result['external_links'],[{'title':'Contact','url':expected}])
+
     def test_wrong_ids_missing_about_and_malformed_links_are_rejected(self):
         with self.assertRaises(ResponseShapeError):
             parse_overview(overview('other'),CHANNEL)

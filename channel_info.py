@@ -155,10 +155,15 @@ def external_links(about):
         item = item.get('channelExternalLinkViewModel', item)
         destinations = list(nodes(item, 'urlEndpoint'))
         url = next((endpoint.get('url') for endpoint in destinations if isinstance(endpoint.get('url'), str)), None)
-        if url and (url.startswith('/redirect?') or urlsplit(url).hostname in ('www.youtube.com', 'youtube.com')):
+        if url and url.startswith('/redirect?'):
+            url = 'https://www.youtube.com' + url
+        if url and urlsplit(url).hostname in ('www.youtube.com', 'youtube.com'):
             parsed = urlsplit(url)
             if parsed.path == '/redirect':
-                url = parse_qs(parsed.query).get('q', [None])[0]
+                destination = parse_qs(parsed.query).get('q', [None])[0]
+                # YouTube accepts bare domains and other non-absolute targets.
+                # Keep its original redirect when there is no public URL to unwrap.
+                url = public_url(destination) or url
         url = public_url(url)
         if url is None:
             # A present link with an unknown shape must not silently disappear.
