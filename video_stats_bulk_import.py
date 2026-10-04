@@ -54,7 +54,12 @@ def statistics_rows(rows):
             evidence = result.get('evidence') or {}
             if evidence.get('response_video_id') != video_id:
                 raise ValueError('Statistics evidence has a mismatched video ID')
-            if values[0] is not None and exact_count(evidence.get('view_text'), 'view') != values[0]:
+            player = evidence.get('view_source') == 'player'
+            if player and values[1] is not None:
+                raise ValueError('Player evidence cannot supply a like count')
+            exact_views = (exact_count(evidence.get('view_count_raw'), 'number') if player else
+                           exact_count(evidence.get('view_text'), 'view'))
+            if values[0] is not None and exact_views != values[0]:
                 raise ValueError('View count does not match exact source evidence')
             kind = 'number' if evidence.get('like_source') == 'title' else 'like'
             if values[1] is not None and exact_count(evidence.get('like_text'), kind) != values[1]:

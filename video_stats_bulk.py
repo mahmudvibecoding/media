@@ -12,7 +12,7 @@ from discovery_storage import load_ranked_proxies
 from metadata_bulk import atomic_json, digest, initialize, utcnow
 
 
-def export_snapshot(folder, ranked, limit=0, *, missing_only=False):
+def export_snapshot(folder, ranked, limit=0, *, missing_only=False, player_views=False):
     folder, ranked = Path(folder), Path(ranked)
     proxies, ranking = load_ranked_proxies(ranked)
     identifiers = [row['proxy_id'] for row in ranking]
@@ -20,10 +20,12 @@ def export_snapshot(folder, ranked, limit=0, *, missing_only=False):
     folder.mkdir(parents=True, exist_ok=False)
     manifest = {'version': 1, 'collector': 'statistics', 'run_id': str(uuid.uuid4()),
                 'created_at': utcnow(), 'files': {}, 'ranked_pool_sha256': digest(ranked),
-                'selection': 'missing_counts' if missing_only else 'all_videos'}
+                'selection': 'missing_views' if player_views else 'missing_counts' if missing_only else 'all_videos',
+                'statistics_endpoint': 'player' if player_views else 'next'}
     counts = Counter()
     videos = folder / 'videos.jsonl.gz'
-    where = 'WHERE view_count IS NULL OR like_count IS NULL' if missing_only else ''
+    where = ('WHERE view_count IS NULL' if player_views else
+             'WHERE view_count IS NULL OR like_count IS NULL' if missing_only else '')
     order = 'md5(video_id),video_id' if limit else 'video_id'
     query = f'SELECT video_id,type,(metadata_updated_at IS NULL)::integer FROM videos {where} ORDER BY {order}'
     if limit:
@@ -63,6 +65,8 @@ def main():
     export.add_argument('--ranked', type=Path, required=True)
     export.add_argument('--limit', type=int, default=0)
     export.add_argument('--missing-only', action='store_true')
+    export.add_argument('--player-views', action='store_true',
+                        help='Recover exact player view counts only for videos still missing views')
     init = sub.add_parser('init')
     init.add_argument('--run', type=Path, required=True)
     init.add_argument('--workers', type=int, default=16)
@@ -72,7 +76,8 @@ def main():
     if args.command == 'export':
         if args.limit < 0:
             parser.error('Limit cannot be negative')
-        result = export_snapshot(args.output, args.ranked, args.limit, missing_only=args.missing_only)
+        result = export_snapshot(args.output, args.ranked, args.limit,
+                                 missing_only=args.missing_only, player_views=args.player_views)
     else:
         if args.workers < 1 or not 1 <= args.concurrency <= 1024 or args.max_attempts < 1:
             parser.error('Invalid worker, concurrency or attempt setting')

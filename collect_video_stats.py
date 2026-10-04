@@ -235,8 +235,8 @@ async def fetch_stats(client, video_id, client_version=CLIENT_VERSION, retries=0
                               total_timeout=total_timeout)
 
 
-async def fetch_player_views(client, video_id, *, on_attempt=None, total_timeout=None):
-    return await _fetch_counts(client, video_id, CLIENT_VERSION, 0,
+async def fetch_player_views(client, video_id, retries=0, *, on_attempt=None, total_timeout=None):
+    return await _fetch_counts(client, video_id, CLIENT_VERSION, retries,
         endpoint='https://www.youtube.com/youtubei/v1/player',
         fields='videoDetails(videoId,viewCount),playabilityStatus(status,reason)',
         parser=parse_player_views, on_attempt=on_attempt, total_timeout=total_timeout)

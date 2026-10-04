@@ -39,10 +39,14 @@ ROOT = Path(__file__).resolve().parent
 @lru_cache(maxsize=32)
 def collector_functions(folder):
     """Select the collector recorded in the immutable run manifest."""
-    kind = json.loads((Path(folder) / 'manifest.json').read_text()).get('collector', 'metadata')
+    manifest = json.loads((Path(folder) / 'manifest.json').read_text())
+    kind = manifest.get('collector', 'metadata')
     if kind == 'statistics':
-        from collect_video_stats import fetch_stats, has_stats, stats_error_reason
-        return fetch_stats, has_stats, stats_error_reason
+        from collect_video_stats import fetch_stats, fetch_player_views, has_stats, stats_error_reason
+        endpoint = manifest.get('statistics_endpoint', 'next')
+        if endpoint not in ('next', 'player'):
+            raise ValueError('Unknown statistics endpoint')
+        return fetch_player_views if endpoint == 'player' else fetch_stats, has_stats, stats_error_reason
     if kind != 'metadata':
         raise ValueError('Unknown collector type')
     return fetch_metadata, has_metadata, metadata_error_reason

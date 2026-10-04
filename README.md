@@ -1172,8 +1172,12 @@ snapshot with `video_stats_bulk.py init --run RUN --workers 32 --concurrency 512
 the statistics collector. The existing queue, committed result batches, recovery,
 and proxy connection reuse also apply to statistics runs.
 The same two-proxy confirmation applies when an identity-checked response exposes
-neither count. Partial results are saved immediately. Statistics collection uses
-`/next`; the bulk worker does not call `/player`.
+neither count. Partial results are saved immediately. The default statistics
+collection uses `/next`. For a recovery pass, add `--player-views` to the export
+command. This selects only videos still missing views and requests their exact
+`/player` count through the same durable queue. Player evidence is checked against
+the returned video ID and raw integer count; it cannot supply a like count.
+Hidden counts remain NULL.
 
 On the database machine, `video_stats_bulk_import.py` accepts `--run RUN` for a local
 run, or `--host`, `--remote`, `--local`, and the manifest's `--run-id` for an SSH worker.

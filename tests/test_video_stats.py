@@ -20,7 +20,7 @@ from database_helpers import connect_test_database
 from collect_video_stats import (MAX_COUNT, ResponseShapeError, exact_count, fetch_stats,
                                  fetch_player_views, has_stats, parse_player_views, parse_stats, stats_error_reason)
 from metadata_bulk import (atomic_json, claim, connect_queue, digest, export_events,
-                           finish, initialize, queue_status)
+                           collector_functions, finish, initialize, queue_status)
 from proxy_statistics import AttemptOutcome
 from proxy_formats import pack_connection_settings
 from video_stats_bulk import export_snapshot as export_statistics_snapshot
@@ -75,6 +75,15 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(manifest['videos'],1)
             self.assertIn('view_count IS NULL OR like_count IS NULL',cursor.execute.call_args.args[0])
             self.assertEqual(digest(folder/'proxies.jsonl.gz'),manifest['files']['proxies.jsonl.gz']['sha256'])
+            cursor.__iter__.return_value = iter([(VIDEO, 'video', 0)])
+            with patch('discovery_storage.connect_database', return_value=nullcontext(catalog)), \
+                 patch('video_stats_bulk.open_database', return_value=nullcontext(media)):
+                recovery = export_statistics_snapshot(Path(directory)/'recovery', ranked, player_views=True)
+            self.assertEqual(recovery['statistics_endpoint'],'player')
+            self.assertEqual(recovery['selection'],'missing_views')
+            query = cursor.execute.call_args.args[0]
+            self.assertIn('WHERE view_count IS NULL ORDER BY',query)
+            self.assertNotIn('like_count IS NULL',query)
 
     def test_invalid_ranked_identity_does_not_leave_a_partial_snapshot(self):
         catalog = MagicMock()
@@ -245,7 +254,7 @@ class RequestTests(unittest.IsolatedAsyncioTestCase):
 
 class QueueTests(unittest.TestCase):
     @contextmanager
-    def queue(self):
+    def queue(self, endpoint='next'):
         with tempfile.TemporaryDirectory() as name:
             folder = Path(name)
             files = {}
@@ -256,7 +265,7 @@ class QueueTests(unittest.TestCase):
                 files[filename] = {'sha256': digest(folder / filename)}
             run_id = str(uuid.uuid4())
             atomic_json(folder / 'manifest.json', {'run_id': run_id, 'videos': 1,
-                        'collector': 'statistics', 'files': files})
+                        'collector': 'statistics', 'statistics_endpoint':endpoint, 'files': files})
             initialize(folder, 1, 1, 5)
             yield folder, run_id
 
@@ -279,6 +288,39 @@ class QueueTests(unittest.TestCase):
             export_events(folder)
             _, rows = read_chunk(next((folder / 'outbox').glob('*.gz')), run_id)
             self.assertEqual(statistics_rows(rows)[0][2:4], (348, 3))
+
+    def test_player_recovery_dispatches_and_journals_exact_zero_views(self):
+        with self.queue('player') as (folder, run_id):
+            fetch, check, _ = collector_functions(str(folder.resolve()))
+            self.assertIs(fetch, fetch_player_views)
+            async def request():
+                def respond(req):
+                    self.assertEqual(req.url.path,'/youtubei/v1/player')
+                    return httpx.Response(200,json={'videoDetails':{'videoId':VIDEO,'viewCount':'0'}})
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    return await fetch(client,VIDEO,retries=0)
+            result = asyncio.run(request())
+            self.assertTrue(check(result))
+            e = event()
+            e['result'] = result
+            claim(folder,0,1)
+            finish(folder,0,[e])
+            export_events(folder)
+            _, rows = read_chunk(next((folder/'outbox').glob('*.gz')),run_id)
+            self.assertEqual(statistics_rows(rows)[0][2:4],(0,None))
+            altered = deepcopy(rows)
+            altered[0]['event']['result']['evidence']['view_count_raw'] = '1'
+            with self.assertRaisesRegex(ValueError,'exact source evidence'):
+                statistics_rows(altered)
+            altered = deepcopy(rows)
+            altered[0]['event']['result']['stats']['like_count'] = 0
+            with self.assertRaisesRegex(ValueError,'cannot supply a like count'):
+                statistics_rows(altered)
+
+    def test_unknown_statistics_endpoint_is_rejected(self):
+        with self.queue('unknown') as (folder,_):
+            with self.assertRaisesRegex(ValueError,'Unknown statistics endpoint'):
+                collector_functions(str(folder.resolve()))
 
     def test_two_distinct_proxies_confirm_video_error_and_end_retries(self):
         with self.queue() as (folder, run_id):
@@ -414,6 +456,20 @@ class DatabaseTests(unittest.TestCase):
         self.conn.execute('DELETE FROM videos')
         with self.assertRaisesRegex(ValueError, 'missing'):
             self.apply()
+
+    def test_player_recovery_preserves_known_likes_and_replays_once(self):
+        self.conn.execute('UPDATE videos SET like_count=7')
+        e = event()
+        e.update(final=True,successful=True)
+        e['result'] = dict(parse_player_views({'videoDetails':{'videoId':VIDEO,'viewCount':'0'}},VIDEO),
+                           status='ok',video_id=VIDEO,http_status=200)
+        values = statistics_rows([{'event':e}])
+        with self.conn.transaction():
+            self.assertEqual(apply_statistics(self.conn,values)['statistics_saved'],1)
+        with self.conn.transaction():
+            self.assertEqual(apply_statistics(self.conn,values)['statistics_saved'],0)
+        self.assertEqual(self.conn.execute('SELECT title,view_count,like_count FROM videos').fetchone(),
+                         ('Keep',0,7))
 
 
 if __name__ == '__main__':
