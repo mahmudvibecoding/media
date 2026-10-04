@@ -151,14 +151,14 @@ def apply_observations(conn, observations, journal_key, run_id, *, retest_second
                 youtube_successful_data_received=h.youtube_successful_data_received+excluded.youtube_successful_data_received,
                 youtube_weighted_attempts=CASE WHEN excluded.youtube_last_scored_attempt_at IS NULL
                     THEN h.youtube_weighted_attempts ELSE
-                    public.proxy_decayed_weight(h.youtube_weighted_attempts,h.youtube_last_scored_attempt_at,
-                        greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at))
+                    coalesce(public.proxy_decayed_weight(h.youtube_weighted_attempts,h.youtube_last_scored_attempt_at,
+                        greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at)),0)
                     + public.proxy_decayed_weight(excluded.youtube_weighted_attempts,excluded.youtube_last_scored_attempt_at,
                         greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at)) END,
                 youtube_weighted_successful_data_received=CASE WHEN excluded.youtube_last_scored_attempt_at IS NULL
                     THEN h.youtube_weighted_successful_data_received ELSE
-                    public.proxy_decayed_weight(h.youtube_weighted_successful_data_received,h.youtube_last_scored_attempt_at,
-                        greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at))
+                    coalesce(public.proxy_decayed_weight(h.youtube_weighted_successful_data_received,h.youtube_last_scored_attempt_at,
+                        greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at)),0)
                     + public.proxy_decayed_weight(excluded.youtube_weighted_successful_data_received,excluded.youtube_last_scored_attempt_at,
                         greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at)) END,
                 youtube_last_scored_attempt_at=greatest(h.youtube_last_scored_attempt_at,excluded.youtube_last_scored_attempt_at),

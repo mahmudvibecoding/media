@@ -435,3 +435,10 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(report['observations'], 1)
         self.assertFalse((self.folder/'current-test.json').exists())
         self.assertEqual(self.live.execute('SELECT connection_attempts,youtube_responses_received FROM public.proxy_stats').fetchone(), (1,0))
+
+    def test_first_data_score_after_reachability_only_has_zero_prior_weight(self):
+        self.seed(self.live, 1)
+        apply_observations(self.live, [self.observation(1, data=None)], b'u'*32, 'unscored')
+        apply_observations(self.live, [self.observation(1, data=True, seconds=1)], b's'*32, 'scored', quality=True)
+        self.assertEqual(self.live.execute('SELECT connection_attempts,youtube_successful_data_received,youtube_weighted_attempts,youtube_weighted_successful_data_received FROM public.proxy_stats').fetchone(), (2,1,1.0,1.0))
+        self.assertEqual(self.live.execute('SELECT quality_checked_at FROM app_meta.proxy_test_state').fetchone()[0], self.at+timedelta(seconds=1))
