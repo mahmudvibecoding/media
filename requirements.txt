@@ -2,3 +2,9 @@ httpx[http2]==0.28.1
 httpcore==1.0.9
 psycopg[binary]==3.3.6
 PyYAML==6.0.3
+fastapi==0.142.2
+uvicorn==0.54.0
+jinja2==3.1.6
+psycopg-pool==3.3.3
+itsdangerous==2.2.0
+python-multipart==0.0.32

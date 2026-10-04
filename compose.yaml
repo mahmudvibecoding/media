@@ -133,6 +133,47 @@ services:
         soft: 1048576
         hard: 1048576
 
+  dashboard-setup:
+    image: ${COMPOSE_PROJECT_NAME:-media}-backend:local
+    profiles: ["tools"]
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Run sh scripts/setup.sh first}
+      MEDIA_DASHBOARD_DB_PASSWORD: ${MEDIA_DASHBOARD_DB_PASSWORD:-}
+    command: ["python", "configure_dashboard.py", "grant"]
+    restart: "no"
+
+  dashboard:
+    image: ${COMPOSE_PROJECT_NAME:-media}-backend:local
+    profiles: ["dashboard"]
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      PGHOST: db
+      PGUSER: media_dashboard
+      PGPASSWORD: ${MEDIA_DASHBOARD_DB_PASSWORD:-}
+      MEDIA_DASHBOARD_USERNAME: ${MEDIA_DASHBOARD_USERNAME:-mahmud}
+      MEDIA_DASHBOARD_PASSWORD_HASH: ${MEDIA_DASHBOARD_PASSWORD_HASH:-}
+      MEDIA_DASHBOARD_SECRET: ${MEDIA_DASHBOARD_SECRET:-}
+      MEDIA_DASHBOARD_SECURE_COOKIES: ${MEDIA_DASHBOARD_SECURE_COOKIES:-0}
+    ports:
+      - "127.0.0.1:${MEDIA_DASHBOARD_PORT:-8050}:8080"
+    command: ["python", "-m", "uvicorn", "dashboard.app:app", "--host", "0.0.0.0", "--port", "8080", "--no-proxy-headers", "--limit-concurrency", "64"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   database:
   collector-state:

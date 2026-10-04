@@ -1,0 +1,37 @@
+{% from 'icons.html' import icon %}
+{% if not result.rows and not error %}
+<section class="empty-state"><span class="empty-symbol">{{ icon('search',26) }}</span><h2>{% if selected.q %}No matches yet{% else %}Nothing here yet{% endif %}</h2><p>{% if selected.q %}Try another keyword, a shorter phrase, or clear your filters.{% else %}There are no saved {{ selected.kind }} for this selection.{% endif %}</p></section>
+{% elif selected.kind=='channels' %}
+<div class="table-wrap"><table class="records channels-table"><thead><tr><th>Channel</th><th class="numeric">Subscribers</th><th class="numeric hide-mobile">Videos</th><th class="hide-mobile">Country</th><th><span class="sr-only">Browse</span></th></tr></thead><tbody>
+{% for row in result.rows %}
+{% set detail_url=selected.url(detail=row.channel_id,detail_video='') %}
+<tr data-record-id="{{ row.channel_id }}"><td><a class="identity record-link" href="{{ detail_url }}" hx-get="{{ detail_url }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-push-url="true">
+  <span class="avatar">{% if row.avatar_url|image_url %}<img src="{{ row.avatar_url|image_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" data-fallback-image>{% endif %}<span class="avatar-fallback" aria-hidden="true">{{ (row.title or row.handle or '?')[0]|upper }}</span></span>
+  <span class="identity-text"><span class="record-title">{{ (row.title or ('Unavailable channel' if row.metadata_error else 'Untitled channel'))|highlight(selected.q) }}</span><span class="record-subtitle">{{ (row.handle or row.channel_id)|highlight(selected.q) }}</span>{% if selected.q %}<span class="search-snippet">{{ row.description|highlight(selected.q,150) }}</span>{% endif %}</span>
+</a></td><td class="numeric">{{ row.subscriber_count|number }}</td><td class="numeric hide-mobile">{{ row.video_count|number }}</td><td class="hide-mobile country-cell">{{ row.country or '—' }}</td><td class="row-action"><a href="/videos?channel={{ row.channel_id }}" hx-get="/videos?channel={{ row.channel_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" aria-label="Browse videos from {{ row.title or row.handle or row.channel_id }}">{{ icon('arrow',18) }}</a></td></tr>
+{% endfor %}
+</tbody></table></div>
+{% elif selected.kind=='videos' %}
+<div class="table-wrap"><table class="records videos-table"><thead><tr><th>Video</th><th class="hide-mobile">Published</th><th class="numeric">Views</th><th class="numeric hide-mobile">Likes</th><th><span class="sr-only">Browse</span></th></tr></thead><tbody>
+{% for row in result.rows %}
+{% set detail_url=selected.url(detail=row.video_id,detail_video='') %}
+<tr data-record-id="{{ row.video_id }}"><td><div class="video-identity"><a class="thumbnail record-link" href="{{ detail_url }}" hx-get="{{ detail_url }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-push-url="true" aria-label="Details for {{ row.title or 'Untitled video' }}">
+  {% if row.thumbnail_url|image_url %}<img src="{{ row.thumbnail_url|image_url }}" alt="" loading="lazy" referrerpolicy="no-referrer" data-fallback-image>{% endif %}<span class="thumbnail-fallback" aria-hidden="true">{{ icon('videos',24) }}</span><span class="duration">{{ row.duration_seconds|duration }}</span>
+</a><div class="identity-text"><a class="record-title record-link" href="{{ detail_url }}" hx-get="{{ detail_url }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-push-url="true">{{ (row.title or 'Untitled video')|highlight(selected.q) }}</a><span class="record-subtitle"><a href="/videos?channel={{ row.channel_id }}" hx-get="/videos?channel={{ row.channel_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">{{ row.channel_title or row.channel_handle or 'Untitled channel' }}</a>{% if row.type=='short' %}<span class="small-tag">Short</span>{% endif %}</span>{% if selected.q %}<span class="search-snippet">{{ row.description|highlight(selected.q,150) }}</span>{% endif %}</div></div></td>
+<td class="hide-mobile date-cell">{{ row.published_at|date_label }}</td><td class="numeric">{{ row.view_count|number }}</td><td class="numeric hide-mobile">{{ row.like_count|number }}</td><td class="row-action"><a href="/comments?video={{ row.video_id }}" hx-get="/comments?video={{ row.video_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" aria-label="Browse comments on {{ row.title or row.video_id }}">{{ icon('comments',18) }}</a></td></tr>
+{% endfor %}
+</tbody></table></div>
+{% else %}
+<section class="comments-list" aria-label="Comments">
+{% for row in result.rows %}
+{% set detail_url=selected.url(detail=row.comment_id,detail_video=row.video_id) %}
+<article class="comment-row" data-record-id="{{ row.video_id }}:{{ row.comment_id }}">
+  <span class="comment-avatar" aria-hidden="true">{{ (row.author_name or '?')[0]|upper }}</span>
+  <div class="comment-body"><div class="comment-byline"><strong>{{ (row.author_name or 'Unknown author')|highlight(selected.q) }}</strong>{% if row.is_pinned %}<span class="pinned-tag">{{ icon('pin',12) }}Pinned</span>{% endif %}</div>
+  <a class="comment-text record-link" href="{{ detail_url }}" hx-get="{{ detail_url }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-push-url="true">{{ row.text|highlight(selected.q,360) }}</a>
+  <div class="comment-context">{{ icon('videos',14) }}<a href="/comments?video={{ row.video_id }}" hx-get="/comments?video={{ row.video_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">{{ row.video_title or 'Untitled video' }}</a><span>·</span><a href="/comments?channel={{ row.channel_id }}" hx-get="/comments?channel={{ row.channel_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">{{ row.channel_title or 'Untitled channel' }}</a></div></div>
+  <a class="icon-button record-link comment-open" href="{{ detail_url }}" hx-get="{{ detail_url }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-push-url="true" aria-label="Read full comment by {{ row.author_name or 'unknown author' }}">{{ icon('arrow',17) }}</a>
+</article>
+{% endfor %}
+</section>
+{% endif %}

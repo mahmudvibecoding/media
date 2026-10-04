@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"historyCacheSize":0,"historyRestoreAsHxRequest":false}'>
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}Media Library{% endblock %}</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/library.css">
+  <script src="/assets/htmx.min.js" defer></script>
+  <script src="/assets/library.js" defer></script>
+</head>
+<body>
+  {% block body %}{% endblock %}
+  <div class="network-notice" id="network-notice" role="alert" hidden>Connection interrupted. Please try again.</div>
+</body>
+</html>

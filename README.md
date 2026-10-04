@@ -47,6 +47,66 @@ The YouTube database starts empty. To explicitly import all bundled channel IDs:
 docker compose run --rm backend python manage.py import-channels
 ```
 
+### Browse channels, videos, and comments
+
+Media Library provides three searchable sections, sorting, 50 records per page,
+and detail panels with full descriptions and links to saved videos and comments.
+Start it after the Docker setup (the setup command uses host Python 3):
+
+```sh
+sh scripts/start-dashboard.sh
+```
+
+The command creates `.env.dashboard` and `.local/dashboard-access.txt` with
+private file permissions, applies the schema migration, grants a dedicated
+database user read access, and builds search indexes. The first index build can
+take several minutes on a large collection. Repeating the command preserves the
+credentials and skips valid indexes. The dashboard restarts automatically with
+Docker. Its HTTP port is bound to `127.0.0.1:8050`.
+
+For the deployed server, open an SSH tunnel from your computer, then visit
+<http://127.0.0.1:8050> and sign in using the access file:
+
+```sh
+ssh -N -L 127.0.0.1:8050:127.0.0.1:8050 root@198.163.196.164
+```
+
+Search matches words regardless of case. Multiple words must all match; put a
+phrase in double quotes to match adjacent words. `OR` and `-word` are supported.
+Uzbek apostrophe variants are normalized. Channels search names, handles,
+descriptions, and keywords, and also accepts partial names of three characters
+or more. Videos search titles and descriptions. Comments search their full text
+and author names. Matches are highlighted. Search and filters are included in
+the URL; links require login. Press `/` to focus search.
+
+Channel rows link to their saved videos; video rows link to their saved comments.
+The Channels table's video count is the public YouTube count. Detail panels label
+the separate saved count. Comments support a pinned filter; their default order
+groups by video because the stored comments have no publication timestamp.
+Header totals use exact database counts cached for ten minutes. Filtered results
+show the current page size, without claiming an exact matching total.
+
+The service uses FastAPI, Jinja2, locally bundled HTMX 2.0.11 (Zero-Clause BSD), and
+PostgreSQL. Migration `013` installs normalization functions and `pg_trgm`.
+`prepare_dashboard.py` separately creates twelve indexes with `CONCURRENTLY`,
+using up to three database connections and 2 GiB maintenance memory per table.
+It records index-definition hashes and can rebuild an interrupted invalid index.
+Searches have an eight-second statement limit; pagination uses signed cursors
+bound to the current filters. The dashboard role has `SELECT` privileges on
+the three media tables and uses read-only transactions. Login uses a generated
+password, a PBKDF2 hash, signed HttpOnly sessions, and CSRF protection. For access
+through an HTTPS reverse proxy, set `MEDIA_DASHBOARD_SECURE_COOKIES=1`.
+
+To stop the dashboard:
+
+```sh
+docker compose --env-file .env --env-file .env.dashboard stop dashboard
+```
+
+Dashboard regression checks are included in `sh scripts/check_docker.sh`, which
+uses a fresh, disposable PostgreSQL instance and exercises database queries,
+forward/backward pagination, phrases, filters, login, CSRF, and escaped HTML.
+
 ### Collect new video IDs from every saved channel
 
 After importing your media data and completing a proxy test, run:

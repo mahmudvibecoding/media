@@ -33,6 +33,7 @@ COPY --chmod=755 docker/pg_restore.sh /usr/local/bin/pg_restore
 COPY --chmod=755 docker/pg_restore.sh /usr/local/bin/pg_dump
 RUN pg_restore --version && pg_dump --version
 COPY *.py ./
+COPY dashboard/ ./dashboard/
 COPY db/ ./db/
 COPY data/channels.csv ./data/channels.csv
 COPY proxy-tester/*.py ./proxy-tester/

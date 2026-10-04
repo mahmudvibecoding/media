@@ -1,0 +1,57 @@
+{% from 'icons.html' import icon %}
+<main id="workspace" data-section="{{ selected.kind }}" class="workspace" hx-indicator="#loading-line">
+  <div class="loading-line" id="loading-line" aria-hidden="true"></div>
+  <nav class="tabs" aria-label="Library sections">
+    {% for tab in ('channels','videos','comments') %}
+    <a class="tab {% if selected.kind==tab %}active{% endif %}" href="/{{ tab }}" data-tab="{{ tab }}" hx-get="/{{ tab }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" {% if selected.kind==tab %}aria-current="page"{% endif %}>
+      {{ icon(tab) }}<span>{{ tab|title }}</span><span class="tab-count">{{ totals[tab]|compact }}</span>
+    </a>
+    {% endfor %}
+  </nav>
+  <section class="section-heading">
+    <div>
+      <div class="eyebrow">THE COLLECTION</div>
+      <h1>{{ selected.kind|title }}</h1>
+      <p class="section-subtitle">{% if selected.kind=='channels' %}The people and communities behind the videos.{% elif selected.kind=='videos' %}Explore the stories in your collection.{% else %}See what people are saying.{% endif %}</p>
+    </div>
+    <span class="collection-total"><strong>{{ totals[selected.kind]|number }}</strong> in the library</span>
+  </section>
+  {% if scope.get('channel') or scope.get('video') %}
+  <div class="scope-bar">
+    {% if scope.get('channel') %}<a class="scope-link" href="/channels?detail={{ scope.channel.channel_id }}">{{ icon('channels',16) }}{{ scope.channel.title or scope.channel.handle or 'Untitled channel' }}</a>{% endif %}
+    {% if scope.get('video') %}<span class="scope-divider">/</span><a class="scope-link" href="/videos?detail={{ scope.video.video_id }}">{{ icon('videos',16) }}{{ scope.video.title or 'Untitled video' }}</a>{% endif %}
+    <a class="scope-clear" href="{{ selected.url(channel='',video='',cursor='',detail='',detail_video='') }}" hx-get="{{ selected.url(channel='',video='',cursor='',detail='',detail_video='') }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" aria-label="Clear channel and video filters">{{ icon('close',16) }}</a>
+  </div>
+  {% endif %}
+  <form class="toolbar" action="/{{ selected.kind }}" method="get" hx-get="/{{ selected.kind }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" role="search">
+    {% if selected.channel %}<input type="hidden" name="channel" value="{{ selected.channel }}">{% endif %}
+    {% if selected.video %}<input type="hidden" name="video" value="{{ selected.video }}">{% endif %}
+    <div class="search-field">
+      {{ icon('search',20) }}<label class="sr-only" for="search-{{ selected.kind }}">Search {{ selected.kind }}</label>
+      <input id="search-{{ selected.kind }}" class="search-input" name="q" value="{{ selected.q }}" placeholder="{% if selected.kind=='channels' %}Search names, handles, descriptions…{% elif selected.kind=='videos' %}Search titles and descriptions…{% else %}Search comments and authors…{% endif %}" maxlength="200" autocomplete="off" type="search">
+      <button type="submit" class="button primary search-submit">Search</button>
+    </div>
+    {% if selected.kind=='videos' %}
+    <label class="sr-only" for="video-type">Video type</label><select name="type" id="video-type" aria-label="Video type" data-submit-on-change>
+      <option value="">All videos</option><option value="video" {% if selected.type=='video' %}selected{% endif %}>Videos</option><option value="short" {% if selected.type=='short' %}selected{% endif %}>Shorts</option>
+    </select>
+    {% endif %}
+    {% if selected.kind=='comments' %}<label class="check-label"><input type="checkbox" name="pinned" value="1" {% if selected.pinned %}checked{% endif %} data-submit-on-change>{{ icon('pin',15) }}Pinned only</label>{% endif %}
+    <label class="sr-only" for="sort-order">Sort order</label><select id="sort-order" name="sort" aria-label="Sort order" data-submit-on-change>
+      {% for value, config in SORTS[selected.kind].items() %}<option value="{{ value }}" {% if selected.sort==value %}selected{% endif %}>{{ config[0] }}</option>{% endfor %}
+    </select>
+  </form>
+  {% if error %}<div class="error-banner" role="alert">{{ error }} <a href="/{{ selected.kind }}">Start again</a></div>{% endif %}
+  <div class="results-heading" aria-live="polite"><span>{% if selected.q %}Results for <strong>“{{ selected.q }}”</strong>{% else %}All {{ selected.kind }}{% endif %}{% if selected.q %}<a class="clear-search" href="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-get="{{ selected.url(q='',cursor='',detail='',detail_video='') }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Clear</a>{% endif %}</span><span class="keyboard-hint">Press <kbd>/</kbd> to search</span></div>
+  {% include 'results.html' %}
+  {% if result.rows %}
+  <footer class="pagination" aria-label="Pagination">
+    <p><strong>{{ result.rows|length }}</strong> {{ selected.kind }} on this page <span class="pagination-dot">·</span> Page {{ result.page }}</p>
+    <div class="page-actions">
+      {% if result.previous %}<a class="button" href="{{ result.previous }}" hx-get="{{ result.previous }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" data-pagination>{{ icon('left',16) }}Previous</a>{% else %}<button type="button" class="button" disabled>{{ icon('left',16) }}Previous</button>{% endif %}
+      {% if result.next %}<a class="button" href="{{ result.next }}" hx-get="{{ result.next }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true" data-pagination>Next{{ icon('right',16) }}</a>{% else %}<button type="button" class="button" disabled>Next{{ icon('right',16) }}</button>{% endif %}
+    </div>
+  </footer>
+  {% endif %}
+  <div id="detail-layer">{% include 'drawer.html' %}</div>
+</main>

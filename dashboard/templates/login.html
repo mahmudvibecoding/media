@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+{% block title %}Sign in · Media Library{% endblock %}
+{% block body %}
+<main class="login-page">
+  <div class="login-brand"><span class="brand-symbol" aria-hidden="true"><span></span></span>Media Library</div>
+  <section class="login-card" aria-labelledby="login-title">
+    <span class="eyebrow">YOUR YOUTUBE COLLECTION</span>
+    <h1 id="login-title">A closer look starts here.</h1>
+    <p class="muted">Sign in to explore channels, videos, and conversations.</p>
+    {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+    <form method="post" action="/login" class="login-form">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" required value="{{ username }}" maxlength="100">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus maxlength="256">
+      <button class="button primary" type="submit">Sign in <span aria-hidden="true">→</span></button>
+    </form>
+  </section>
+  <p class="login-footnote">Your collection, in one place.</p>
+</main>
+{% endblock %}

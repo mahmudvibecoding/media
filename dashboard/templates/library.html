@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% from 'icons.html' import icon %}
+{% block title %}{{ selected.kind|title }} · Media Library{% endblock %}
+{% block body %}
+<header class="app-header"><div class="header-inner">
+  <a class="brand" href="/channels"><span class="brand-symbol" aria-hidden="true"><span></span></span>Media Library</a>
+  <div class="account"><span class="account-name">{{ username }}</span><span class="account-avatar" aria-hidden="true">{{ username[0]|upper }}</span>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="icon-button" type="submit" aria-label="Sign out">{{ icon('logout') }}</button></form>
+  </div>
+</div></header>
+{% include 'workspace.html' %}
+{% endblock %}

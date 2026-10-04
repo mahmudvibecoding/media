@@ -1,0 +1,31 @@
+{% from 'icons.html' import icon %}
+{% if detail %}
+<dialog id="record-drawer" class="drawer" aria-labelledby="drawer-title" open>
+  <div class="drawer-top"><span class="eyebrow">{{ selected.kind[:-1]|upper }} DETAILS</span><a class="icon-button drawer-close" href="{{ selected.url(detail='',detail_video='') }}" hx-get="{{ selected.url(detail='',detail_video='') }}" hx-target="#detail-layer" hx-swap="innerHTML" hx-replace-url="true" aria-label="Close details">{{ icon('close',20) }}</a></div>
+  <div class="drawer-content">
+    {% if selected.kind=='channels' %}
+      <div class="detail-channel"><span class="avatar detail-avatar">{% if detail.avatar_url|image_url %}<img src="{{ detail.avatar_url|image_url }}" alt="" referrerpolicy="no-referrer" data-fallback-image>{% endif %}<span class="avatar-fallback">{{ (detail.title or detail.handle or '?')[0]|upper }}</span></span><h2 id="drawer-title">{{ detail.title or detail.handle or 'Untitled channel' }}</h2><p class="muted">{{ detail.handle or detail.channel_id }}</p></div>
+      {% if detail.metadata_error %}<p class="status-note">This channel is currently unavailable on YouTube. Previously collected information is shown.</p>{% endif %}
+      <div class="detail-stats"><div><strong>{{ detail.subscriber_count|compact }}</strong><span>Subscribers</span></div><div><strong>{{ detail.video_count|compact }}</strong><span>YouTube videos</span></div><div><strong>{{ detail.view_count|compact }}</strong><span>Total views</span></div></div>
+      <div class="detail-actions"><a class="button primary" href="/videos?channel={{ detail.channel_id }}" hx-get="/videos?channel={{ detail.channel_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Browse {{ detail.saved_videos|number }} saved videos {{ icon('arrow',16) }}</a><a class="button" href="https://www.youtube.com/channel/{{ detail.channel_id }}" target="_blank" rel="noopener noreferrer">Open on YouTube {{ icon('external',15) }}</a></div>
+      <h3>About</h3><div class="full-text">{{ detail.description|highlight(selected.q) if detail.description else 'No description available.' }}</div>
+      <dl class="metadata"><div><dt>Country</dt><dd>{{ detail.country or 'Not listed' }}</dd></div><div><dt>Joined</dt><dd>{{ detail.joined_date|date_label }}</dd></div><div><dt>Profile collected</dt><dd>{{ detail.metadata_updated_at|date_label }}</dd></div><div><dt>Channel ID</dt><dd class="identifier">{{ detail.channel_id }}</dd></div></dl>
+      {% if detail.keywords %}<h3>Keywords</h3><div class="keyword-list">{% for keyword in detail.keywords %}<span>{{ keyword }}</span>{% endfor %}</div>{% endif %}
+      {% if detail.external_links %}<h3>Links</h3><ul class="external-links">{% for link in detail.external_links %}{% if link.url|safe_url %}<li><a href="{{ link.url|safe_url }}" target="_blank" rel="noopener noreferrer">{{ link.title or 'Website' }} {{ icon('external',14) }}</a></li>{% endif %}{% endfor %}</ul>{% endif %}
+    {% elif selected.kind=='videos' %}
+      {% if detail.thumbnail_url|image_url %}<img class="detail-thumbnail" src="{{ detail.thumbnail_url|image_url }}" alt="" referrerpolicy="no-referrer" data-fallback-image>{% endif %}
+      <h2 id="drawer-title">{{ detail.title or 'Untitled video' }}</h2><a class="detail-parent" href="/videos?channel={{ detail.channel_id }}" hx-get="/videos?channel={{ detail.channel_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">{{ detail.channel_title or 'Untitled channel' }}</a>
+      <div class="detail-stats"><div><strong>{{ detail.view_count|compact }}</strong><span>Views</span></div><div><strong>{{ detail.like_count|compact }}</strong><span>Likes</span></div><div><strong>{{ detail.duration_seconds|duration }}</strong><span>Duration</span></div></div>
+      <div class="detail-actions"><a class="button primary" href="/comments?video={{ detail.video_id }}" hx-get="/comments?video={{ detail.video_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Browse {{ detail.saved_comments|number }} saved comments {{ icon('arrow',16) }}</a><a class="button" href="https://www.youtube.com/watch?v={{ detail.video_id }}" target="_blank" rel="noopener noreferrer">Open on YouTube {{ icon('external',15) }}</a></div>
+      <h3>Description</h3><div class="full-text">{{ detail.description|highlight(selected.q) if detail.description else 'No description available.' }}</div>
+      <dl class="metadata"><div><dt>Published</dt><dd>{{ detail.published_at|date_label }}</dd></div><div><dt>Type</dt><dd>{{ 'Short' if detail.type=='short' else 'Video' }}</dd></div><div><dt>Metadata collected</dt><dd>{{ detail.metadata_updated_at|date_label }}</dd></div><div><dt>Statistics collected</dt><dd>{{ detail.stats_updated_at|date_label }}</dd></div><div><dt>Video ID</dt><dd class="identifier">{{ detail.video_id }}</dd></div></dl>
+    {% else %}
+      <div class="comment-detail-heading"><span class="comment-avatar">{{ (detail.author_name or '?')[0]|upper }}</span><div><h2 id="drawer-title">{{ detail.author_name or 'Unknown author' }}</h2>{% if detail.is_pinned %}<span class="pinned-tag">{{ icon('pin',12) }}Pinned comment</span>{% endif %}</div></div>
+      <div class="full-text full-comment">{{ detail.text|highlight(selected.q) }}</div>
+      <h3>On this video</h3><a class="detail-parent" href="/videos?detail={{ detail.video_id }}">{{ detail.video_title or 'Untitled video' }}</a><p class="muted">{{ detail.channel_title or 'Untitled channel' }}</p>
+      <div class="detail-actions"><a class="button primary" href="/comments?video={{ detail.video_id }}" hx-get="/comments?video={{ detail.video_id }}" hx-target="#workspace" hx-swap="outerHTML" hx-push-url="true">Browse video comments {{ icon('arrow',16) }}</a><a class="button" href="https://www.youtube.com/watch?v={{ detail.video_id }}&amp;lc={{ detail.comment_id }}" target="_blank" rel="noopener noreferrer">Open on YouTube {{ icon('external',15) }}</a></div>
+      <dl class="metadata"><div><dt>Comment ID</dt><dd class="identifier">{{ detail.comment_id }}</dd></div>{% if detail.author_channel_id %}<div><dt>Author channel</dt><dd class="identifier">{{ detail.author_channel_id }}</dd></div>{% endif %}</dl>
+    {% endif %}
+  </div>
+</dialog>
+{% endif %}
