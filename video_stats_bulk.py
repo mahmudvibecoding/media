@@ -8,18 +8,16 @@ from pathlib import Path
 import uuid
 
 from discover_videos import open_database
+from discovery_storage import load_ranked_proxies
 from metadata_bulk import atomic_json, digest, initialize, utcnow
-from proxy_catalog import load_catalog
 
 
 def export_snapshot(folder, ranked, limit=0, *, missing_only=False):
     folder, ranked = Path(folder), Path(ranked)
-    folder.mkdir(parents=True, exist_ok=False)
-    ranking = [json.loads(line) for line in ranked.read_text().splitlines()]
+    proxies, ranking = load_ranked_proxies(ranked)
     identifiers = [row['proxy_id'] for row in ranking]
-    if not identifiers or len(set(identifiers)) != len(identifiers):
-        raise ValueError('Responder pool contains duplicate IDs or is empty')
-    by_id = {p.proxy_id: p for p in load_catalog(identifiers)}
+    by_id = {p.proxy_id: p for p in proxies}
+    folder.mkdir(parents=True, exist_ok=False)
     manifest = {'version': 1, 'collector': 'statistics', 'run_id': str(uuid.uuid4()),
                 'created_at': utcnow(), 'files': {}, 'ranked_pool_sha256': digest(ranked),
                 'selection': 'missing_counts' if missing_only else 'all_videos'}

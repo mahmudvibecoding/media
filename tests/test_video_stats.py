@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -10,6 +10,7 @@ from pathlib import Path
 import ssl
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 import uuid
 
 import httpx
@@ -21,6 +22,8 @@ from collect_video_stats import (MAX_COUNT, ResponseShapeError, exact_count, fet
 from metadata_bulk import (atomic_json, claim, connect_queue, digest, export_events,
                            finish, initialize, queue_status)
 from proxy_statistics import AttemptOutcome
+from proxy_formats import pack_connection_settings
+from video_stats_bulk import export_snapshot as export_statistics_snapshot
 from video_stats_bulk_import import (apply_chunk, apply_statistics, read_chunk, statistics_batch,
                                     statistics_rows)
 
@@ -48,6 +51,44 @@ def event(proxy_id=1):
     return {'video_id': VIDEO, 'at': AT.isoformat(), 'result': result,
             'proxy': {'id': proxy_id, 'key': (b'x' * 32).hex(), 'protocol': 'http'},
             'observation': asdict(AttemptOutcome(AT, True, 200, True))}
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_snapshot_uses_verified_protocol_when_catalog_transport_is_generic(self):
+        catalog, media = MagicMock(), MagicMock()
+        catalog.execute.return_value.fetchall.return_value = [
+            (1, b'x'*32, '127.0.0.1', 1080, pack_connection_settings('socks', {}))]
+        cursor = media.cursor.return_value.__enter__.return_value
+        cursor.__iter__.return_value = iter([(VIDEO, 'video', 0)])
+        with tempfile.TemporaryDirectory() as directory:
+            ranked = Path(directory)/'ranked.jsonl'
+            ranked.write_text(json.dumps(dict(proxy_id=1, connection_key=(b'x'*32).hex(),
+                protocol='socks5', score=3, checks=3, average_response_ms=100))+'\n')
+            folder = Path(directory)/'run'
+            with patch('discovery_storage.connect_database', return_value=nullcontext(catalog)), \
+                 patch('video_stats_bulk.open_database', return_value=nullcontext(media)):
+                manifest = export_statistics_snapshot(folder, ranked, missing_only=True)
+            with gzip.open(folder/'proxies.jsonl.gz','rt') as source:
+                proxy = json.loads(source.readline())
+            self.assertEqual((proxy['protocol'],proxy['working_protocol']),('socks','socks5'))
+            self.assertEqual(manifest['protocols'],{'socks5':1})
+            self.assertEqual(manifest['videos'],1)
+            self.assertIn('view_count IS NULL OR like_count IS NULL',cursor.execute.call_args.args[0])
+            self.assertEqual(digest(folder/'proxies.jsonl.gz'),manifest['files']['proxies.jsonl.gz']['sha256'])
+
+    def test_invalid_ranked_identity_does_not_leave_a_partial_snapshot(self):
+        catalog = MagicMock()
+        catalog.execute.return_value.fetchall.return_value = [
+            (1, b'y'*32, '127.0.0.1', 1080, pack_connection_settings('socks', {}))]
+        with tempfile.TemporaryDirectory() as directory:
+            ranked = Path(directory)/'ranked.jsonl'
+            ranked.write_text(json.dumps(dict(proxy_id=1, connection_key=(b'x'*32).hex(),
+                protocol='socks5', score=3, checks=3, average_response_ms=100))+'\n')
+            folder = Path(directory)/'run'
+            with patch('discovery_storage.connect_database', return_value=nullcontext(catalog)):
+                with self.assertRaisesRegex(ValueError,'catalog identity'):
+                    export_statistics_snapshot(folder, ranked, missing_only=True)
+            self.assertFalse(folder.exists())
 
 
 class ParserTests(unittest.TestCase):
