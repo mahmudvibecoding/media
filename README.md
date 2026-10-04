@@ -47,6 +47,51 @@ The YouTube database starts empty. To explicitly import all bundled channel IDs:
 docker compose run --rm backend python manage.py import-channels
 ```
 
+### Collect new video IDs from every saved channel
+
+After importing your media data and completing a proxy test, run:
+
+```sh
+sh scripts/collect-new-videos.sh
+```
+
+From the Mac, for the deployed collection server:
+
+```sh
+ssh root@198.163.196.164 /opt/media-app/scripts/collect-new-videos.sh
+```
+
+The command scans Videos and Shorts for every channel in the server's `media`
+database. It reads the latest ranked proxy file, resolves its catalog IDs once,
+and loads saved video IDs into memory. Every tab paginates through the previously
+stored range or to its end. The collector extracts IDs from channel listings;
+it makes no individual video-validation requests.
+
+Separate worker processes reuse proxy connections and prefer recent usable
+listing responses per second, including time spent on failed attempts. Empty
+listings and pages with no new IDs count as useful responses. One selection in
+twenty samples other eligible proxies. Each proxy has at most one active request.
+Failed pages retry through another available proxy, and unsuccessful tabs receive
+one recovery scan after the worker finishes its first pass.
+
+The parent process writes completed tab scans in batches, targeting 5,000 new IDs
+or one second. It uses `COPY` into a temporary table and one transaction to insert
+each batch, skipping existing IDs. Failed tab scans never become saved stopping
+points. Workers do not query PostgreSQL while fetching pages.
+
+Concurrency starts at 256 and is tuned from measured useful-page throughput;
+the maximum is the size of the ranked pool. The command reports progress and
+creates `summary.json`, `results.jsonl`, `new-video-ids.jsonl`, and
+`unresolved.jsonl` under the shared output volume. Exit status 2 means errors or
+unprocessed tabs remain. A shared state lock prevents overlapping discovery
+runs. Run the same command again to discover subsequent uploads.
+
+For a bounded benchmark or a fixed concurrency:
+
+```sh
+sh scripts/collect-new-videos.sh --limit 1000 --concurrency 512
+```
+
 ### Manual proxy testing
 
 From the application directory, run:

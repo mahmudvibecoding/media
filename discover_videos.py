@@ -267,6 +267,10 @@ async def fetch_page(client, channel_id, video_type, client_version=CLIENT_VERSI
             break
         except httpx.HTTPError as exc:
             result["error"] = type(exc).__name__
+            bridge = getattr(client, "catalog_bridge", None)
+            if bridge is not None and bridge.local_error(exc):
+                result["local_error"] = True
+                break
             if isinstance(exc, httpx.TransportError) and attempt < retries:
                 await asyncio.sleep(2**attempt)
                 continue
@@ -315,7 +319,8 @@ def save_videos(conn, result):
 
 
 async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_VERSION,
-                   retries=2, max_pages=100, stop=None):
+                   retries=2, max_pages=100, stop=None, *, known_ids=None, fetch=None,
+                   persist=True):
     """Buffer a complete scan so partial results cannot become a stopping point."""
     result = {
         "channel_id": channel_id, "type": video_type, "status": "error", "videos": [],
@@ -329,12 +334,15 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
     try:
         buffered, seen_tokens, seen_pages = {}, set(), set()
         continuation = None
-        for page_number in range(1, max_pages + 1):
+        for page_number in range(1, (max_pages or 2**31 - 1) + 1):
             if stop is not None and stop.is_set():
                 result.update(status="interrupted", error="Collection stopped before the scan finished")
                 return result
-            page = await fetch_page(client, channel_id, video_type, client_version, retries,
-                                    continuation=continuation)
+            if fetch is None:
+                page = await fetch_page(client, channel_id, video_type, client_version, retries,
+                                        continuation=continuation)
+            else:
+                page = await fetch(channel_id, video_type, continuation)
             result["pages_fetched"] += 1
             for key in ("attempts", "request_body_bytes", "response_body_bytes", "decoded_body_bytes"):
                 result[key] += page[key]
@@ -356,11 +364,11 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
                 return result
 
             ids = [video["video_id"] for video in page["videos"]]
-            known = {row[0] for row in conn.execute(
+            known = (set(ids) & known_ids) if known_ids is not None else ({row[0] for row in conn.execute(
                 """SELECT video_id FROM public.videos
                    WHERE channel_id=%s AND type=%s AND video_id=ANY(%s)""",
                 (channel_id, video_type, ids),
-            )} if ids else set()
+            )} if ids else set())
             detail["previously_stored_ids"] = len(known)
             for video in page["videos"]:
                 buffered.setdefault(video["video_id"], video)
@@ -389,8 +397,11 @@ async def scan_tab(client, conn, channel_id, video_type, client_version=CLIENT_V
 
         # No transaction is held during HTTP requests. Commit the entire tab's
         # new IDs together so a failed scan cannot leave a false stopping point.
-        with conn.transaction():
-            inserted = save_videos(conn, result)
+        if persist:
+            with conn.transaction():
+                inserted = save_videos(conn, result)
+        else:
+            inserted = []
         result.update(inserted_video_ids=inserted, videos_inserted=len(inserted),
                       videos_already_present=len(result["videos"]) - len(inserted), scan_complete=True)
     except psycopg.Error as exc:
