@@ -1,7 +1,9 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import gzip
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
@@ -13,7 +15,8 @@ import httpx
 import psycopg
 from psycopg.types.json import Jsonb
 
-from collect_proxies import Downloader, Store, connection, now, stored_settings, format_hint_for_url
+from collect_proxies import Downloader, Store, connection, now, stored_settings, format_hint_for_url, prepare_payload, parsed_cache_path
+from proxy_formats import PARSER_VERSION, Proxy, canonical_json, parse_proxies, unpack_connection_settings
 from database_helpers import connect_test_database
 
 
@@ -35,6 +38,22 @@ class FormatHintTests(unittest.TestCase):
         for url,expected in cases.items():
             with self.subTest(url=url):
                 self.assertEqual(format_hint_for_url(url),expected)
+
+    def test_processes_share_complete_parsed_and_copy_caches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            body=b'8.8.8.8:3128\n'*100
+            payload=Path(folder)/'payload.gz'
+            payload.write_bytes(gzip.compress(body))
+            result={'payload_path':str(payload),'content_sha256':hashlib.sha256(body).hexdigest(),
+                    'protocol_hints':['http'],'content_type':'text/plain'}
+            with ProcessPoolExecutor(max_workers=2,mp_context=multiprocessing.get_context('spawn')) as pool:
+                futures=[pool.submit(prepare_payload,result,folder) for _ in range(4)]
+                prepared=[future.result(timeout=20) for future in futures]
+            self.assertTrue(all(value==prepared[0] for value in prepared))
+            self.assertEqual(prepared[0]['metrics']['unique_entries'],1)
+            with gzip.open(prepared[0]['copy'],'rb') as stream:
+                self.assertEqual(len(stream.read().splitlines()),1)
+            self.assertFalse(list((Path(folder)/'parsed').glob('*.tmp')))
 
 
 class DownloadTests(unittest.IsolatedAsyncioTestCase):
@@ -183,6 +202,23 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(stored['transport'],'vless')
         self.assertIsInstance(stored['options'],str)
         self.assertEqual(json.loads(stored['options']),original)
+
+    def test_prepared_copy_preserves_settings_and_upgrades_an_existing_cache(self):
+        self.add_list('https://test.invalid/a')
+        result=self.payload(b'8.8.8.8:443\n')
+        original={'prefix\x00key':'\x16\x03\x00','password':'tab\tline\nbackslash\\',
+                  'nested':{'name':'Unicode \u00e9'}}
+        proxy=Proxy('8.8.8.8',443,'vless',original)
+        cache=parsed_cache_path(PARSER_VERSION,result['content_sha256'],result['protocol_hints'])
+        cache.parent.mkdir(parents=True)
+        with gzip.open(cache,'wt') as stream:
+            stream.write(canonical_json(parse_proxies(b'8.8.8.8:443\n').summary())+'\n')
+            stream.write(canonical_json(proxy.as_dict())+'\n')
+        prepared=prepare_payload(result,Path(self.temp.name))
+        self.store.save(dict(result,_prepared=prepared))
+        saved=self.conn.execute('SELECT connection_key,connection_settings FROM proxies').fetchone()
+        self.assertEqual(saved['connection_key'],proxy.key)
+        self.assertEqual(unpack_connection_settings(saved['connection_settings']),('vless',original))
 
     def test_deduplication_reparse_and_atomic_failure(self):
         self.add_list('https://test.invalid/a')

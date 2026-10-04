@@ -186,6 +186,12 @@ with up to 32 GitHub downloads and 16 downloads per other host. Override these
 with `MEDIA_PROXY_SOURCE_CONCURRENCY`, `MEDIA_PROXY_SOURCE_GITHUB_CONCURRENCY`,
 and `MEDIA_PROXY_SOURCE_PER_HOST`.
 
+Parsing and preparation of PostgreSQL input use separate worker processes, while
+one writer commits each source with its new configurations. Parsing uses up to
+eight processes based on available CPUs and memory; override this with
+`MEDIA_PROXY_SOURCE_PARSE_WORKERS` (zero selects automatic sizing). Shared payload
+caches avoid repeated parsing of identical lists.
+
 To test the current catalog without refreshing it:
 
 ```sh

@@ -308,12 +308,12 @@ class DatabaseTests(unittest.TestCase):
              patch.object(sources.Downloader,'public_url',new=AsyncMock(return_value=True)), \
              patch.object(httpx,'AsyncClient',side_effect=client), \
              patch.object(service,'test_catalog',side_effect=test_catalog):
-            result=service.refresh(Settings(),self.folder,stop,service.Status(self.folder,stop),self.live)
+            result=service.refresh(Settings(source_parse_workers=2),self.folder,stop,service.Status(self.folder,stop),self.live)
             self.assertEqual(result['sources']['new_configurations'],1)
             self.assertEqual(result['sources']['source_errors'],1)
             self.assertEqual((order[0],order[-1]),('import','test'))
             self.assertEqual(set(requested),{'/good','/broken'})
-            again=service.refresh(Settings(),self.folder,stop,service.Status(self.folder,stop),self.live)
+            again=service.refresh(Settings(source_parse_workers=2),self.folder,stop,service.Status(self.folder,stop),self.live)
         self.assertEqual(again['sources']['new_configurations'],0)
         self.assertEqual(json.loads((self.folder/'last-refresh.json').read_text())['new_checks'],6)
         failed=Path(again['sources']['failed_sources_path']).read_text().splitlines()
@@ -333,7 +333,7 @@ class DatabaseTests(unittest.TestCase):
                 await asyncio.sleep(60)
             return httpx.Response(200,content=b'8.8.8.8:3128\n')
         real_client=httpx.AsyncClient
-        options=sources.argument_parser().parse_args(['--concurrency','1'])
+        options=sources.argument_parser().parse_args(['--concurrency','1','--parse-workers','2'])
         options.auto_resume,options.inventory=True,False
         with patch.object(sources,'connection',side_effect=self.source_connection), \
              patch.object(sources,'STORAGE',self.folder/'sources'), \

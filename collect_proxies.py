@@ -8,13 +8,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+from concurrent.futures import ProcessPoolExecutor
+import fcntl
 import gzip
 import hashlib
 import ipaddress
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import socket
+import tempfile
 import time
 from urllib.parse import urljoin, urlsplit
 import uuid
@@ -27,7 +31,7 @@ from psycopg.types.json import Jsonb
 
 from proxy_formats import PARSER_VERSION, Proxy, canonical_json, pack_connection_settings, parse_proxies
 from proxy_pagination import next_page
-from proxy_service_common import write_json
+from proxy_service_common import available_memory, write_json
 from runtime_config import ROOT, STATE_DIR, connect_database
 
 STORAGE = STATE_DIR / 'proxy-collection'
@@ -60,9 +64,62 @@ def format_hint_for_url(url):
     return Path(urlsplit(url).path).suffix.lower().removeprefix('.') or None
 
 
-def parsed_cache_path(version, checksum, hints):
+def parsed_cache_path(version, checksum, hints, storage=None):
     key = hashlib.sha256(canonical_json([version, checksum, hints]).encode()).hexdigest()
-    return STORAGE / 'parsed' / (key + '.jsonl.gz')
+    return Path(storage or STORAGE) / 'parsed' / (key + '.jsonl.gz')
+
+
+def copy_line(proxy, key=None):
+    values = ('\\x' + (key or proxy.key).hex(), proxy.address, str(proxy.port),
+              canonical_json(pack_connection_settings(proxy.protocol, proxy.settings)))
+    return ('\t'.join(value.replace('\\', '\\\\').replace('\t', '\\t')
+                     .replace('\n', '\\n').replace('\r', '\\r') for value in values) + '\n').encode()
+
+
+def prepare_payload(result, storage):
+    """Parse and serialize outside the downloader and database writer processes."""
+    cache = parsed_cache_path(PARSER_VERSION, result['content_sha256'], result['protocol_hints'], storage)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    copy_cache = cache.with_suffix('.copy-v1.gz')
+    # Identical feeds share a cache. A process dying releases this lock; only
+    # complete files are published, so a later run can prepare the payload again.
+    with cache.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        temporary = []
+        def temporary_path():
+            fd, name = tempfile.mkstemp(prefix=cache.name+'.', suffix='.tmp', dir=cache.parent)
+            os.close(fd)
+            path = Path(name)
+            temporary.append(path)
+            return path
+        try:
+            if not cache.exists():
+                with gzip.open(result['payload_path'], 'rb') as payload:
+                    parsed = parse_proxies(payload.read(), result['protocol_hints'], result.get('content_type', ''))
+                metrics = parsed.summary()
+                parsed_temp, copy_temp = temporary_path(), temporary_path()
+                with gzip.open(parsed_temp, 'wt', encoding='utf-8', compresslevel=3) as entries, \
+                     gzip.open(copy_temp, 'wb', compresslevel=3) as prepared:
+                    entries.write(canonical_json(metrics)+'\n')
+                    for key, proxy in parsed.proxies.items():
+                        entries.write(canonical_json(proxy.as_dict())+'\n')
+                        prepared.write(copy_line(proxy, key))
+                parsed_temp.replace(cache)
+                copy_temp.replace(copy_cache)
+            else:
+                with gzip.open(cache, 'rt', encoding='utf-8') as entries:
+                    metrics = json.loads(next(entries))
+                    if not copy_cache.exists():
+                        copy_temp = temporary_path()
+                        with gzip.open(copy_temp, 'wb', compresslevel=3) as prepared:
+                            for line in entries:
+                                row = json.loads(line)
+                                prepared.write(copy_line(Proxy(row['address'],row['port'],row['protocol'],row['settings'])))
+                        copy_temp.replace(copy_cache)
+            return {'cache':str(cache), 'copy':str(copy_cache), 'metrics':metrics}
+        finally:
+            for path in temporary:
+                path.unlink(missing_ok=True)
 
 
 def same_parsed_entries(left, right):
@@ -164,24 +221,9 @@ class Store:
         return ordered
 
     def parsed_cache(self, result):
-        hints = result['protocol_hints']
-        cache = parsed_cache_path(PARSER_VERSION, result['content_sha256'], hints)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        if not cache.exists():
-            with gzip.open(result['payload_path'], 'rb') as f:
-                parsed = parse_proxies(f.read(), hints, result.get('content_type', ''))
-            temp = cache.with_suffix('.tmp')
-            try:
-                with gzip.open(temp, 'wt', encoding='utf-8', compresslevel=3) as f:
-                    f.write(canonical_json(parsed.summary()) + '\n')
-                    for proxy in parsed.proxies.values():
-                        f.write(canonical_json(proxy.as_dict()) + '\n')
-                temp.replace(cache)
-            finally:
-                temp.unlink(missing_ok=True)
-        with gzip.open(cache, 'rt', encoding='utf-8') as f:
-            metrics = json.loads(next(f))
-        return cache, metrics
+        prepared = result.get('_prepared') or prepare_payload(result, STORAGE)
+        result['_prepared'] = prepared
+        return Path(prepared['cache']), prepared['metrics']
 
     def save(self, result):
         cache = None
@@ -213,13 +255,9 @@ class Store:
             if cache and result['unique_entries'] and not unchanged_entries:
                 with self.writer.cursor().copy('''COPY proxy_stage
                     (connection_key,address,port,connection_settings) FROM STDIN''') as cp:
-                    with gzip.open(cache, 'rt', encoding='utf-8') as f:
-                        next(f)
-                        for line in f:
-                            row = json.loads(line)
-                            proxy = Proxy(row['address'], row['port'], row['protocol'], row['settings'])
-                            cp.write_row((proxy.key, proxy.address, proxy.port,
-                                          stored_settings(proxy.settings, proxy.protocol)))
+                    with gzip.open(result['_prepared']['copy'], 'rb') as prepared:
+                        while block := prepared.read(1024*1024):
+                            cp.write(block)
                 self.writer.execute('ANALYZE proxy_stage')
                 result['new_configurations'] = self.writer.execute('''WITH added AS (INSERT INTO proxies
                     (connection_key,address,port,connection_settings,last_seen_at)
@@ -515,6 +553,9 @@ async def main(args, *, exclusive_owner=None, stop=None, on_progress=None):
     downloader = Downloader(args)
     began = time.monotonic()
     queue = asyncio.Queue(maxsize=max(2, args.concurrency))
+    parser_workers = getattr(args, 'parse_workers', 1)
+    parsers = ProcessPoolExecutor(max_workers=parser_workers, mp_context=multiprocessing.get_context('spawn'))
+    parse_limit = asyncio.Semaphore(parser_workers)
     finished = 0
     failed = False
     try:
@@ -528,6 +569,7 @@ async def main(args, *, exclusive_owner=None, stop=None, on_progress=None):
         work = store.prepare(args)
         output({'run_id': str(store.run_id), 'urls_to_process': len(work),
                 'concurrency': args.concurrency, 'github_concurrency': args.github_concurrency,
+                'parse_workers': parser_workers,
                 'per_other_host': args.per_host, 'resume_command': f'.venv/bin/python collect_proxies.py --run-id {store.run_id}'})
         async def download(row):
             if args.reparse or args.complete_pagination:
@@ -538,6 +580,10 @@ async def main(args, *, exclusive_owner=None, stop=None, on_progress=None):
                     result = await downloader.complete_pages(result, row)
             else:
                 result = await downloader.fetch(row)
+            if result['status'] in {'downloaded','downloaded_partial'}:
+                async with parse_limit:
+                    result['_prepared'] = await asyncio.get_running_loop().run_in_executor(
+                        parsers, prepare_payload, result, STORAGE)
             await queue.put(result)
 
         async def producer():
@@ -597,6 +643,10 @@ async def main(args, *, exclusive_owner=None, stop=None, on_progress=None):
         raise
     finally:
         try:
+            if failed and hasattr(parsers, 'terminate_workers'):
+                parsers.terminate_workers()
+            else:
+                parsers.shutdown(wait=True, cancel_futures=True)
             await downloader.client.aclose()
             if store.run_id is not None:
                 summary = store.finish(failed=failed,inventory=getattr(args,'inventory',True))
@@ -618,6 +668,9 @@ def argument_parser():
     parser.add_argument('--concurrency', type=int, default=24)
     parser.add_argument('--per-host', type=int, default=2)
     parser.add_argument('--github-concurrency', type=int, default=8)
+    parser.add_argument('--parse-workers', type=int,
+                        default=max(1,min(8,os.cpu_count() or 1,available_memory()//(2*1024**3))),
+                        help='Processes for parsing and preparing database input')
     parser.add_argument('--retries', type=int, default=2)
     parser.add_argument('--max-bytes', type=int, default=256 * 1024 * 1024,
                         help='Maximum decoded bytes per list; oversized responses are recorded as incomplete')
@@ -627,7 +680,8 @@ def argument_parser():
 if __name__ == '__main__':
     parser = argument_parser()
     parsed_args = parser.parse_args()
-    if min(parsed_args.concurrency, parsed_args.per_host, parsed_args.github_concurrency, parsed_args.max_bytes) < 1:
+    if min(parsed_args.concurrency, parsed_args.per_host, parsed_args.github_concurrency,
+           parsed_args.parse_workers, parsed_args.max_bytes) < 1:
         parser.error('Concurrency and maximum size must be positive')
     if parsed_args.retries < 0 or (parsed_args.take is not None and parsed_args.take < 1):
         parser.error('Invalid retry count or take count')

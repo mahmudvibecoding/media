@@ -39,6 +39,7 @@ class Settings:
     source_concurrency: int = 128
     source_per_host: int = 16
     source_github_concurrency: int = 32
+    source_parse_workers: int = 0
 
     @classmethod
     def environment(cls):
@@ -54,6 +55,9 @@ class Settings:
             ('source_github_concurrency','MEDIA_PROXY_SOURCE_GITHUB_CONCURRENCY','32'))}
         if min(sources.values()) < 1:
             raise ValueError('Source concurrency settings must be positive')
+        sources['source_parse_workers'] = int(os.environ.get('MEDIA_PROXY_SOURCE_PARSE_WORKERS','0'))
+        if sources['source_parse_workers'] < 0:
+            raise ValueError('Source parsing processes must be positive; zero selects automatic sizing')
         cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 2
         return cls(repository=repository, test_concurrency=concurrency or automatic_concurrency(),
                    test_workers=workers or max(1, min(4, cpus // 12)), **sources)
@@ -90,6 +94,8 @@ def refresh(settings, home, stop, status, owner, *, test_only=False):
         options.concurrency = settings.source_concurrency
         options.per_host = settings.source_per_host
         options.github_concurrency = settings.source_github_concurrency
+        if settings.source_parse_workers:
+            options.parse_workers = settings.source_parse_workers
         options.auto_resume,options.inventory = True,False
         stages['sources'] = asyncio.run(collect_sources(options,exclusive_owner=owner,stop=stop,
             on_progress=lambda value:status.update(sources=value)))
