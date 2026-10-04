@@ -71,6 +71,11 @@ For the deployed server, open an SSH tunnel from your computer, then visit
 ssh -N -L 127.0.0.1:8050:127.0.0.1:8050 root@198.163.196.164
 ```
 
+On the Mac, `sh scripts/open-dashboard.sh` reuses or opens the private tunnel
+and opens the browser. Add `--no-open` to check the connection without opening a
+tab. The current setup also includes an `Open Media Library.command` launcher
+in Downloads.
+
 Search matches words regardless of case. Multiple words must all match; put a
 phrase in double quotes to match adjacent words. `OR` and `-word` are supported.
 Uzbek apostrophe variants are normalized. Channels search names, handles,
