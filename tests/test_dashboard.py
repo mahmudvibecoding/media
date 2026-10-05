@@ -249,7 +249,7 @@ class DashboardIntegrationTests(unittest.TestCase):
                 self.assertEqual(client.get(next_page).status_code,200)
             response = client.get('/comments?q=%22blue+quiet+river%22',headers={'HX-Request':'true'})
             self.assertEqual(response.status_code,200)
-            self.assertIn('<mark>blue</mark>',response.text)
+            self.assertIn('<mark>blue quiet river</mark>',response.text)
             self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;',response.text)
             self.assertNotIn('HX-Redirect',response.headers)
             response = client.get('/comments?detail=shared-comment&detail_video=V0000000000',
