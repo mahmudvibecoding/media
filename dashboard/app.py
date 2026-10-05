@@ -1,4 +1,4 @@
-"""Media Library: authenticated pages and small HTML updates."""
+"""Media Library: searchable pages with optional authentication."""
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +36,7 @@ class Settings:
     secret: str = ''
     secure_cookies: bool = False
     conninfo: str = ''
+    auth_required: bool = True
 
     @classmethod
     def environment(cls):
@@ -43,6 +44,7 @@ class Settings:
             password_hash=os.environ.get('MEDIA_DASHBOARD_PASSWORD_HASH',''),
             secret=os.environ.get('MEDIA_DASHBOARD_SECRET',''),
             secure_cookies=os.environ.get('MEDIA_DASHBOARD_SECURE_COOKIES') == '1',
+            auth_required=os.environ.get('MEDIA_DASHBOARD_AUTH_REQUIRED') != '0',
             conninfo=make_conninfo(**database_options('media')))
 
     @property
@@ -128,7 +130,7 @@ def create_app(settings=None, repository=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        if len(settings.secret) < 32 or not settings.password_hash.startswith('pbkdf2_sha256$'):
+        if len(settings.secret) < 32 or (settings.auth_required and not settings.password_hash.startswith('pbkdf2_sha256$')):
             raise RuntimeError('Configure dashboard access with sh scripts/start-dashboard.sh')
         repo.open()
         try:
@@ -158,7 +160,8 @@ def create_app(settings=None, repository=None):
         return response
 
     def authenticated(request):
-        return request.session.get('user') == settings.username and request.session.get('version') == settings.version
+        return not settings.auth_required or (request.session.get('user') == settings.username
+                                             and request.session.get('version') == settings.version)
 
     def require_login(request: Request):
         if not authenticated(request):
@@ -174,7 +177,8 @@ def create_app(settings=None, repository=None):
 
     def render(request, template, context, status=200):
         return templates.TemplateResponse(request=request,name=template,context={
-            'username':settings.username,'csrf':request.session.get('csrf',''),**context},status_code=status)
+            'username':settings.username,'csrf':request.session.get('csrf',''),
+            'auth_required':settings.auth_required,**context},status_code=status)
 
     app.mount('/assets',StaticFiles(directory=ROOT/'static'),name='assets')
 
@@ -197,6 +201,8 @@ def create_app(settings=None, repository=None):
 
     @app.post('/login')
     async def login(request: Request):
+        if not settings.auth_required:
+            return RedirectResponse('/channels',status_code=303)
         form = await request.form(max_fields=5,max_files=0)
         csrf(request,form.get('csrf',''))
         password = str(form.get('password',''))
@@ -212,6 +218,8 @@ def create_app(settings=None, repository=None):
 
     @router.post('/logout')
     async def logout(request: Request):
+        if not settings.auth_required:
+            return RedirectResponse('/channels',status_code=303)
         form = await request.form(max_fields=2,max_files=0)
         csrf(request,form.get('csrf',''))
         request.session.clear()

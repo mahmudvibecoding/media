@@ -236,6 +236,33 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertEqual(client.post('/logout',data=dict(csrf=csrf),follow_redirects=False).status_code,303)
             self.assertEqual(client.get('/videos',follow_redirects=False).status_code,303)
 
+    def test_public_access_search_pagination_and_details_without_session(self):
+        settings = Settings(secret=SECRET,auth_required=False)
+        with TestClient(create_app(settings,self.repo)) as client:
+            for kind in SORTS:
+                response = client.get('/'+kind,follow_redirects=False)
+                self.assertEqual(response.status_code,200)
+                self.assertNotIn('Sign out',response.text)
+                self.assertNotIn('class="account"',response.text)
+                self.assertNotIn('set-cookie',response.headers)
+                next_page = self.repo.search(Selection(kind=kind,sort=next(iter(SORTS[kind]))))['next']
+                self.assertEqual(client.get(next_page).status_code,200)
+            response = client.get('/comments?q=%22blue+quiet+river%22',headers={'HX-Request':'true'})
+            self.assertEqual(response.status_code,200)
+            self.assertIn('<mark>blue</mark>',response.text)
+            self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;',response.text)
+            self.assertNotIn('HX-Redirect',response.headers)
+            response = client.get('/comments?detail=shared-comment&detail_video=V0000000000',
+                                  headers={'HX-Request':'true','HX-Target':'detail-layer'})
+            self.assertEqual(response.status_code,200)
+            self.assertIn('id="record-drawer"',response.text)
+            for method, path, destination in (('GET','/login?next=/videos','/videos'),
+                                               ('POST','/login','/channels'),('POST','/logout','/channels')):
+                response = client.request(method,path,follow_redirects=False)
+                self.assertEqual(response.status_code,303)
+                self.assertEqual(response.headers['location'],destination)
+            self.assertFalse(client.cookies)
+
 
 if __name__ == '__main__':
     unittest.main()
