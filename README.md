@@ -64,7 +64,7 @@ take several minutes on a large collection. Repeating the command preserves the
 credentials and skips valid indexes. The dashboard restarts automatically with
 Docker. Its HTTP port is bound to `127.0.0.1:8050`.
 
-For the deployed server, open an SSH tunnel from your computer, then visit
+For a private deployment, open an SSH tunnel from your computer, then visit
 <http://127.0.0.1:8050> and sign in using the access file:
 
 ```sh
@@ -82,7 +82,7 @@ Uzbek apostrophe variants are normalized. Channels search names, handles,
 descriptions, and keywords, and also accepts partial names of three characters
 or more. Videos search titles and descriptions. Comments search their full text
 and author names. Matches are highlighted. Search and filters are included in
-the URL; links require login. Press `/` to focus search.
+the URL. Private deployments require login. Press `/` to focus search.
 
 Channel rows link to their saved videos; video rows link to their saved comments.
 The Channels table's video count is the public YouTube count. Detail panels label
@@ -115,6 +115,61 @@ docker compose --env-file .env --env-file .env.dashboard stop dashboard
 Dashboard regression checks are included in `sh scripts/check_docker.sh`, which
 uses a fresh, disposable PostgreSQL instance and exercises database queries,
 forward/backward pagination, phrases, filters, login, CSRF, and escaped HTML.
+
+### Public HTTPS dashboard
+
+The server dashboard is available at <https://198.163.196.164> without login.
+`compose.public-dashboard.yaml` explicitly sets `MEDIA_DASHBOARD_AUTH_REQUIRED=0`
+and runs nginx on ports 80 and 443. The database and application port remain
+bound to loopback; requests reach the same read-only dashboard database role.
+Omitting the public overlay keeps authentication enabled by default.
+
+For a Linux deployment at `/opt/media-app`, keep the dashboard's internal host
+port at 8050 and include all three Compose files in `.env`:
+
+```dotenv
+COMPOSE_FILE=compose.yaml:compose.host-network.yaml:compose.public-dashboard.yaml
+```
+
+After the regular dashboard setup, bootstrap the HTTP challenge endpoint and
+request an IP certificate (substitute the server's actual public IPv4 address):
+
+```sh
+compose() { docker compose --env-file .env --env-file .env.dashboard "$@"; }
+mkdir -p .local/dashboard-tls
+cp docker/dashboard-http.conf .local/dashboard-tls/server.conf
+compose up -d --no-deps dashboard-web
+compose run --rm --no-deps dashboard-certbot certonly --non-interactive \
+  --agree-tos --register-unsafely-without-email --preferred-profile shortlived \
+  --webroot --webroot-path /var/www/acme --cert-name media-dashboard-ip \
+  --ip-address 198.163.196.164 --dry-run
+# Repeat the same certonly command without --dry-run to save the certificate.
+cp docker/dashboard-https.conf .local/dashboard-tls/server.conf
+compose exec -T dashboard-web nginx -t
+compose exec -T dashboard-web nginx -s reload
+compose build backend
+compose up -d --no-deps dashboard
+```
+
+IP certificates are short-lived, so install the supplied systemd timer. It
+checks for renewal twice daily and reloads nginx after Certbot succeeds:
+
+```sh
+install -m 644 docker/media-dashboard-cert-renew.service docker/media-dashboard-cert-renew.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now media-dashboard-cert-renew.timer
+sh scripts/renew-dashboard-certificate.sh --dry-run
+curl --fail https://198.163.196.164/health
+```
+
+Port 80 must stay reachable for certificate validation; normal HTTP requests
+redirect to HTTPS. Certificate state lives in the `dashboard-certificates`
+Docker volume. Check renewal with `systemctl status media-dashboard-cert-renew.timer`
+and `journalctl -u media-dashboard-cert-renew.service`.
+
+To return to private access, stop `dashboard-web`, disable the renewal timer,
+remove the public overlay from `COMPOSE_FILE`, and recreate `dashboard` with
+`compose up -d --no-deps dashboard`. Keep the certificate volume for rollback.
 
 ### Collect new video IDs from every saved channel
 

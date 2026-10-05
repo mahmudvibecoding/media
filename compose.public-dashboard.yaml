@@ -1,0 +1,43 @@
+# Linux HTTPS endpoint; use with compose.yaml and compose.host-network.yaml.
+services:
+  dashboard:
+    environment:
+      MEDIA_DASHBOARD_AUTH_REQUIRED: "0"
+      MEDIA_DASHBOARD_SECURE_COOKIES: "1"
+
+  dashboard-web:
+    image: nginx:stable-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
+    profiles: ["public-dashboard"]
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/var/cache/nginx:size=32m", "/var/run:size=1m"]
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "SETUID", "SETGID", "NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["nginx"]
+    command: ["-g", "daemon off;"]
+    volumes:
+      - ./.local/dashboard-tls:/etc/nginx/dashboard:ro
+      - dashboard-certificates:/etc/letsencrypt:ro
+      - dashboard-acme:/var/www/acme:ro
+    # A directory mount allows replacing the configuration before a reload.
+    configs:
+      - source: dashboard-nginx-main
+        target: /etc/nginx/nginx.conf
+
+  dashboard-certbot:
+    image: certbot/certbot:v5.8.0@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20
+    profiles: ["tools"]
+    volumes:
+      - dashboard-certificates:/etc/letsencrypt
+      - dashboard-acme:/var/www/acme
+    restart: "no"
+
+configs:
+  dashboard-nginx-main:
+    file: ./docker/dashboard-nginx.conf
+
+volumes:
+  dashboard-certificates:
+  dashboard-acme:

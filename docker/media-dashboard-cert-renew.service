@@ -1,0 +1,11 @@
+[Unit]
+Description=Renew the Media Library HTTPS certificate
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/media-app
+ExecStart=/bin/sh /opt/media-app/scripts/renew-dashboard-certificate.sh
+TimeoutStartSec=15min
