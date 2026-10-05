@@ -162,6 +162,18 @@ def parse_player_views(payload, video_id):
     if not isinstance(payload, dict):
         raise ResponseShapeError('Response is not an object')
     details = payload.get('videoDetails') or {}
+    player_status = path(payload, 'playabilityStatus', 'status')
+    player_reason = path(payload, 'playabilityStatus', 'reason')
+    if not details and player_status in ('ERROR', 'UNPLAYABLE', 'LOGIN_REQUIRED'):
+        if player_reason is not None and not isinstance(player_reason, str):
+            raise ResponseShapeError('Invalid player availability reason')
+        unavailable = dict(stats=None, stats_complete=False, player_status=player_status,
+            player_reason=player_reason, evidence={'requested_video_id': video_id})
+        # Player errors can omit videoDetails. They never supply a count or claim
+        # a returned identity; only explicit availability reasons are neutral.
+        reason = video_error_reason(dict(status='ok', http_status=200, **unavailable))
+        unavailable['error'] = reason or player_status+(': '+player_reason if player_reason else '')
+        return unavailable
     if not isinstance(details, dict) or details.get('videoId') != video_id:
         raise ResponseShapeError('Player response video ID does not match the requested ID')
     raw = details.get('viewCount')

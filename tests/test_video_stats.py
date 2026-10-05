@@ -101,6 +101,18 @@ class SnapshotTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_player_availability_without_video_details_never_supplies_counts(self):
+        for status,reason,error in [('ERROR','Video unavailable','VIDEO_UNAVAILABLE'),
+                                    ('LOGIN_REQUIRED','This video is private.','VIDEO_PRIVATE'),
+                                    ('LOGIN_REQUIRED',None,'LOGIN_REQUIRED')]:
+            result = parse_player_views({'playabilityStatus':{'status':status,'reason':reason}},VIDEO)
+            self.assertIsNone(result['stats'])
+            self.assertEqual(result['error'],error)
+            self.assertEqual(result['evidence'],{'requested_video_id':VIDEO})
+        with self.assertRaises(ResponseShapeError):
+            parse_player_views({'videoDetails':{'videoId':'wrongvideo','viewCount':'4'},
+                                'playabilityStatus':{'status':'ERROR','reason':'Video unavailable'}},VIDEO)
+
     def test_player_views_require_exact_matching_id_and_preserve_unavailable(self):
         data = {'videoDetails': {'videoId': VIDEO, 'viewCount': '0'},
                 'playabilityStatus': {'status': 'LIVE_STREAM_OFFLINE'}}
@@ -321,6 +333,25 @@ class QueueTests(unittest.TestCase):
         with self.queue('unknown') as (folder,_):
             with self.assertRaisesRegex(ValueError,'Unknown statistics endpoint'):
                 collector_functions(str(folder.resolve()))
+
+    def test_player_unavailability_is_neutral_and_confirmed_by_distinct_proxies(self):
+        with self.queue('player') as (folder,run_id):
+            for proxy_id in (1,2):
+                result = dict(parse_player_views({'playabilityStatus':{
+                    'status':'ERROR','reason':'Video unavailable'}},VIDEO),
+                    status='ok',http_status=200,video_id=VIDEO)
+                e = event(proxy_id)
+                e['result'] = result
+                e['observation'].update(data_received=None,website_error='video:video_unavailable')
+                claim(folder,0,1)
+                finish(folder,0,[e])
+                self.assertEqual(queue_status(folder)['jobs'],{'retry' if proxy_id==1 else 'failed':1})
+                self.requeue(folder)
+            with connect_queue(folder/'queue.sqlite3') as conn:
+                self.assertEqual(conn.execute('SELECT sum(samples) FROM proxy_performance').fetchone()[0],0)
+            export_events(folder)
+            _,rows = read_chunk(next((folder/'outbox').glob('*.gz')),run_id)
+            self.assertEqual(statistics_rows(rows)[0][-1],'VIDEO_UNAVAILABLE')
 
     def test_two_distinct_proxies_confirm_video_error_and_end_retries(self):
         with self.queue() as (folder, run_id):
